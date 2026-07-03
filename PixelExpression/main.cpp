@@ -197,9 +197,11 @@ static int basketAttempts = 0;
 static int basketMade = 0;
 static bool basketShotActive = false;
 static bool basketShotMade = false;
+static bool basketShotScored = false;
 static bool basketResultReady = false;
 static uint32_t basketResultUntil = 0;
 static uint32_t basketLastShotMs = 0;
+static uint32_t basketNetAnimStart = 0;
 static float basketBallT = 0.0f;
 static float basketBallX = 0.0f;
 static float basketBallY = 0.0f;
@@ -1751,8 +1753,10 @@ void basketInit() {
   basketMade = 0;
   basketShotActive = false;
   basketShotMade = false;
+  basketShotScored = false;
   basketResultReady = false;
   basketResultUntil = 0;
+  basketNetAnimStart = 0;
   basketLastShotMs = 0;
   basketBallX = screenW / 2.0f;
   basketBallY = screenH - 80.0f;
@@ -1793,6 +1797,7 @@ void basketStartShot(float power) {
   basketLastShotMs = now;
   basketAttempts++;
   basketResultReady = false;
+  basketShotScored = false;
 
   float quality = 1.0f - fabsf(power - 1.35f) * 0.42f;
   quality = clampf(quality, 0.0f, 1.0f);
@@ -1802,7 +1807,7 @@ void basketStartShot(float power) {
   basketStartX = screenW / 2.0f + (rand() % 17 - 8);
   basketStartY = screenH - 72.0f;
   basketEndX = screenW / 2.0f;
-  basketEndY = 112.0f;
+  basketEndY = 138.0f;
   if (!basketShotMade) {
     int miss = 34 + (rand() % 28);
     basketEndX += ((rand() % 2) ? miss : -miss);
@@ -1844,7 +1849,14 @@ void basketUpdate(float dt, bool shootInput) {
       float fall = basketBallT - 1.0f;
       if (basketShotMade) {
         basketBallX = screenW / 2.0f;
-        basketBallY = 112.0f + fall * 78.0f;
+        basketBallY = 138.0f + fall * 96.0f;
+        if (!basketShotScored) {
+          basketShotScored = true;
+          basketMade++;
+          basketScore += 2;
+          basketNetAnimStart = millis();
+          if (basketScore > basketBest) basketBest = basketScore;
+        }
       } else {
         basketBallY = basketEndY + fall * fall * 360.0f;
       }
@@ -1854,12 +1866,11 @@ void basketUpdate(float dt, bool shootInput) {
       basketShotActive = false;
       basketResultReady = true;
       basketResultUntil = millis() + 900;
-      if (basketShotMade) {
-        basketMade++;
-        basketScore += 2;
-        if (basketScore > basketBest) basketBest = basketScore;
-      }
     }
+  }
+
+  if (basketNetAnimStart != 0 && millis() - basketNetAnimStart >= (uint32_t)(BASKET_HOOP_FRAMES * BASKET_HOOP_FRAME_MS)) {
+    basketNetAnimStart = 0;
   }
 
   if (basketResultReady && millis() > basketResultUntil) {
@@ -1882,7 +1893,11 @@ void drawBasketBall(int x, int y, int r) {
 
 void drawBasketHoop() {
   int x0 = screenW / 2 - BASKET_HOOP_W / 2;
-  int y0 = 24;
+  int y0 = -30;
+  int frame = 0;
+  if (basketNetAnimStart != 0) {
+    frame = min(BASKET_HOOP_FRAMES - 1, (int)((millis() - basketNetAnimStart) / BASKET_HOOP_FRAME_MS));
+  }
   for (int y = 0; y < BASKET_HOOP_H; ++y) {
     int sy = y0 + y;
     if (sy < 0 || sy >= screenH) continue;
@@ -1891,8 +1906,8 @@ void drawBasketHoop() {
       int sx = x0 + x;
       if (sx < 0 || sx >= screenW) continue;
       int idx = row + x;
-      if (!pgm_read_byte(&BASKET_HOOP_MASK[idx])) continue;
-      uint16_t c = pgm_read_word(&BASKET_HOOP_PIXELS[idx]);
+      uint16_t c = pgm_read_word(&BASKET_HOOP_PIXELS[frame][idx]);
+      if (c == 0x0000) continue;
       if (useCanvas) canvas.drawPixel(sx, sy, c);
       else M5.Display.drawPixel(sx, sy, c);
     }
