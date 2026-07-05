@@ -3,6 +3,8 @@
 #include <math.h>
 #include "racing.h"
 #include "basket_hoop_sprite.h"
+#include "shot_sound.h"
+#include "miss_sound.h"
 
 static constexpr uint8_t KEY_A_PIN = 2;  // StopWatch KEYA (yellow)
 static constexpr uint8_t KEY_B_PIN = 1;  // StopWatch KEYB (blue)
@@ -71,10 +73,13 @@ static int screenOffsetX = 0;
 static int screenOffsetY = 0;
 
 // ---- 游戏模式 ----
-enum GameMode { MODE_MENU, MODE_FOOTBALL, MODE_RACING, MODE_BASKETBALL };
+enum GameMode { MODE_MENU, MODE_FOOTBALL, MODE_RACING, MODE_BASKETBALL, MODE_CAR_SELECT };
 static GameMode gameMode = MODE_MENU;
 static constexpr int GAME_COUNT = 3;
 static int menuSelected = 0;        // 菜单当前选中项 0=足球 1=赛车 2=空气投篮
+static int carSelectIndex = 0;     // 选车页当前轮播索引 0~8
+static bool carSelectConfirmed = false;  // 是否已选中(等待二次确认开始)
+static bool carSelectTouchPrev = false;  // 上一帧触摸状态(边沿触发防误触)
 
 static int fieldLeft = 20;
 static int fieldRight = 448;
@@ -198,10 +203,16 @@ static int basketMade = 0;
 static bool basketShotActive = false;
 static bool basketShotMade = false;
 static bool basketShotScored = false;
+static bool basketScorePendingHighlight = false;   // 进球后等待网动画结束再高亮
+static uint32_t basketScoreHighlightUntil = 0;     // 分数高亮结束时刻(millis)
+static uint32_t basketMissShowUntil = 0;            // MISS 文字显示结束时刻(millis，与 SWISH 同时长)
 static bool basketResultReady = false;
 static uint32_t basketResultUntil = 0;
 static uint32_t basketLastShotMs = 0;
 static uint32_t basketNetAnimStart = 0;
+static uint32_t basketMissHoopStart = 0;          // Miss 时篮筐抖动动画起始时刻
+#define BASKET_MISS_FRAME_MS  90                   // Miss 篮筐动画每帧时长
+#define BASKET_MISS_TOTAL_MS  (BASKET_MISS_FRAME_MS * 6)  // Miss 动画总时长(6 步)
 static float basketBallT = 0.0f;
 static float basketBallX = 0.0f;
 static float basketBallY = 0.0f;
@@ -217,6 +228,7 @@ static float basketPower = 0.0f;
 static float basketLastAccelMag = 1.0f;
 static float basketSwingMeter = 0.0f;
 static bool basketImuReady = false;
+static bool speakerReady = false;
 
 Player& controlledPlayer() {
   if (controlled == HOME_KEEPER_CONTROL) return homeKeeper;
@@ -458,6 +470,22 @@ extern "C" {
     if (useCanvas) canvas.fillEllipse(x, y, rx, ry, c);
     else M5.Display.fillEllipse(x, y, rx, ry, c);
   }
+  // 抗锯齿椭圆：drawEllipse 描边(LGFX 内置 AA)包住 fillEllipse 填充，边缘柔化
+  void gfxSmoothEllipse(int x, int y, int rx, int ry, uint16_t c) {
+    if (rx < 1 || ry < 1) { gfxEllipse(x, y, rx, ry, c); return; }
+    if (useCanvas) {
+      canvas.fillEllipse(x, y, rx, ry, c);
+      canvas.drawEllipse(x, y, rx, ry, c);
+    } else {
+      M5.Display.fillEllipse(x, y, rx, ry, c);
+      M5.Display.drawEllipse(x, y, rx, ry, c);
+    }
+  }
+  void gfxSmoothCircle(int x, int y, int r, uint16_t c) {
+    if (r < 1) return;
+    if (useCanvas) canvas.fillSmoothCircle(x, y, r, c);
+    else M5.Display.fillSmoothCircle(x, y, r, c);
+  }
   void gfxDrawCircle(int x, int y, int r, uint16_t c) {
     if (useCanvas) canvas.drawCircle(x, y, r, c);
     else M5.Display.drawCircle(x, y, r, c);
@@ -465,6 +493,38 @@ extern "C" {
   void gfxDrawRoundRect(int x, int y, int w, int h, int r, uint16_t c) {
     if (useCanvas) canvas.drawRoundRect(x, y, w, h, r, c);
     else M5.Display.drawRoundRect(x, y, w, h, r, c);
+  }
+  // 带 size 参数的居中文本(用 textSize 放大 Font0 实现任意字号)
+  void gfxTextCenterS(const char* s, int x, int y, int size, uint16_t c, uint16_t bg) {
+    if (useCanvas) {
+      canvas.setFont(&fonts::Font0);
+      canvas.setTextSize(size);
+      canvas.setTextDatum(textdatum_t::middle_center);
+      canvas.setTextColor(c, (bg == 0xFFFF) ? c : bg);
+      canvas.drawString(s, x, y);
+    } else {
+      M5.Display.setFont(&fonts::Font0);
+      M5.Display.setTextSize(size);
+      M5.Display.setTextDatum(textdatum_t::middle_center);
+      M5.Display.setTextColor(c, (bg == 0xFFFF) ? c : bg);
+      M5.Display.drawString(s, x, y);
+    }
+  }
+  // Font4 + size 参数：矢量字体放大，保持抗锯齿(比 Font0 缩放清晰)
+  void gfxTextCenterF4(const char* s, int x, int y, int size, uint16_t c, uint16_t bg) {
+    if (useCanvas) {
+      canvas.setFont(&fonts::Font4);
+      canvas.setTextSize(size);
+      canvas.setTextDatum(textdatum_t::middle_center);
+      canvas.setTextColor(c, (bg == 0xFFFF) ? c : bg);
+      canvas.drawString(s, x, y);
+    } else {
+      M5.Display.setFont(&fonts::Font4);
+      M5.Display.setTextSize(size);
+      M5.Display.setTextDatum(textdatum_t::middle_center);
+      M5.Display.setTextColor(c, (bg == 0xFFFF) ? c : bg);
+      M5.Display.drawString(s, x, y);
+    }
   }
   void gfxTextCenter(const char* s, int x, int y, int font, uint16_t c, uint16_t bg) {
     if (useCanvas) {
@@ -1748,15 +1808,20 @@ void drawGame() {
 }
 
 void basketInit() {
+  M5.Power.setVibration(0);   // 保险：重置游戏时关震动，避免退出后马达继续转
   basketScore = 0;
   basketAttempts = 0;
   basketMade = 0;
   basketShotActive = false;
   basketShotMade = false;
   basketShotScored = false;
+  basketScorePendingHighlight = false;
+  basketScoreHighlightUntil = 0;
+  basketMissShowUntil = 0;
   basketResultReady = false;
   basketResultUntil = 0;
   basketNetAnimStart = 0;
+  basketMissHoopStart = 0;
   basketLastShotMs = 0;
   basketBallX = screenW / 2.0f;
   basketBallY = screenH - 80.0f;
@@ -1798,6 +1863,9 @@ void basketStartShot(float power) {
   basketAttempts++;
   basketResultReady = false;
   basketShotScored = false;
+  basketMissShowUntil = 0;        // 新投篮开始：清掉残留 MISS 文字计时
+  basketMissHoopStart = 0;        // 新投篮开始：清掉残留篮筐抖动动画
+  basketScoreHighlightUntil = 0;  // 新投篮开始：清掉残留分数高亮
 
   float quality = 1.0f - fabsf(power - 1.35f) * 0.42f;
   quality = clampf(quality, 0.0f, 1.0f);
@@ -1821,6 +1889,16 @@ void basketStartShot(float power) {
   basketBallT = 0.0f;
   basketSpin = 0.0f;
   basketShotActive = true;
+}
+
+void playShotSound() {
+  if (!speakerReady) return;
+  M5.Speaker.playRaw(SHOT_SOUND_DATA, SHOT_SOUND_LEN, SHOT_SOUND_SAMPLE_RATE, false, 1, 0, true);
+}
+
+void playMissSound() {
+  if (!speakerReady) return;
+  M5.Speaker.playRaw(MISS_SOUND_DATA, MISS_SOUND_LEN, MISS_SOUND_SAMPLE_RATE, false, 1, 0, true);
 }
 
 void basketUpdate(float dt, bool shootInput) {
@@ -1852,10 +1930,10 @@ void basketUpdate(float dt, bool shootInput) {
         basketBallY = 138.0f + fall * 96.0f;
         if (!basketShotScored) {
           basketShotScored = true;
-          basketMade++;
-          basketScore += 2;
           basketNetAnimStart = millis();
-          if (basketScore > basketBest) basketBest = basketScore;
+          basketScorePendingHighlight = true;   // 网动画播完后再加分+高亮
+          playShotSound();
+          M5.Power.setVibration(200);            // 进球震动：强档(随网动画开始)
         }
       } else {
         basketBallY = basketEndY + fall * fall * 360.0f;
@@ -1866,11 +1944,25 @@ void basketUpdate(float dt, bool shootInput) {
       basketShotActive = false;
       basketResultReady = true;
       basketResultUntil = millis() + 900;
+      if (!basketShotMade) {
+        playMissSound();
+        basketMissShowUntil = millis() + 3000;   // MISS 显示时长与 SWISH/高亮一致(3s)
+        basketMissHoopStart = millis();          // 启动篮筐抖动动画(用 0/1/5 帧)
+      }
     }
   }
 
   if (basketNetAnimStart != 0 && millis() - basketNetAnimStart >= (uint32_t)(BASKET_HOOP_FRAMES * BASKET_HOOP_FRAME_MS)) {
     basketNetAnimStart = 0;
+    M5.Power.setVibration(0);                  // 网动画结束：关震动
+    // 网动画播完：此时再加分 + 触发高亮(分数变化滞后于篮筐动效)
+    if (basketScorePendingHighlight) {
+      basketScorePendingHighlight = false;
+      basketMade++;
+      basketScore += 2;
+      if (basketScore > basketBest) basketBest = basketScore;
+      basketScoreHighlightUntil = millis() + 3000;   // 渐显0.4+保持2.2+渐隐0.4
+    }
   }
 
   if (basketResultReady && millis() > basketResultUntil) {
@@ -1896,7 +1988,15 @@ void drawBasketHoop() {
   int y0 = -30;
   int frame = 0;
   if (basketNetAnimStart != 0) {
+    // 进球：网动画，0→N 线性遍历
     frame = min(BASKET_HOOP_FRAMES - 1, (int)((millis() - basketNetAnimStart) / BASKET_HOOP_FRAME_MS));
+  } else if (basketMissHoopStart != 0) {
+    // Miss：篮筐被撞抖动，用 0/1/5 三帧序列(撞→回弹→静止)
+    // 6 步序列：0 → 1 → 5 → 1 → 0 → 0
+    static const uint8_t missSeq[6] = {0, 1, 5, 1, 0, 0};
+    int step = (int)((millis() - basketMissHoopStart) / BASKET_MISS_FRAME_MS);
+    if (step >= 6) step = 5;
+    frame = missSeq[step];
   }
   for (int y = 0; y < BASKET_HOOP_H; ++y) {
     int sy = y0 + y;
@@ -1914,7 +2014,54 @@ void drawBasketHoop() {
   }
 }
 
-void drawSevenSegment(int x, int y, int w, int h, int digit, uint16_t c) {
+void drawSegBarCore(float cx, float cy, float len, float thick, bool horiz, uint16_t color) {
+  float half = len * 0.5f;
+  float ht = thick * 0.5f;
+  float bevel = thick * 0.56f;
+  auto tri = [&](float ax, float ay, float bx, float by, float ex, float ey) {
+    int iax = (int)roundf(ax);
+    int iay = (int)roundf(ay);
+    int ibx = (int)roundf(bx);
+    int iby = (int)roundf(by);
+    int iex = (int)roundf(ex);
+    int iey = (int)roundf(ey);
+    if (useCanvas) canvas.fillTriangle(iax, iay, ibx, iby, iex, iey, color);
+    else M5.Display.fillTriangle(iax, iay, ibx, iby, iex, iey, color);
+  };
+  if (horiz) {
+    int x = (int)roundf(cx - half + bevel);
+    int y = (int)roundf(cy - thick * 0.5f);
+    int w = (int)roundf(len - bevel * 2.0f);
+    int h = (int)roundf(thick);
+    box(x, y, w, h, color);
+    tri(cx - half, cy, cx - half + bevel, cy - ht, cx - half + bevel, cy + ht);
+    tri(cx + half, cy, cx + half - bevel, cy - ht, cx + half - bevel, cy + ht);
+  } else {
+    int x = (int)roundf(cx - thick * 0.5f);
+    int y = (int)roundf(cy - half + bevel);
+    int w = (int)roundf(thick);
+    int h = (int)roundf(len - bevel * 2.0f);
+    box(x, y, w, h, color);
+    tri(cx, cy - half, cx - ht, cy - half + bevel, cx + ht, cy - half + bevel);
+    tri(cx, cy + half, cx - ht, cy + half - bevel, cx + ht, cy + half - bevel);
+  }
+}
+
+void drawSegBar(float cx, float cy, float len, float thick, bool horiz, bool active, uint16_t lit) {
+  if (!active) return;
+  uint16_t outline = C_BLACK;
+  drawSegBarCore(cx - 2.0f, cy, len, thick, horiz, outline);
+  drawSegBarCore(cx + 2.0f, cy, len, thick, horiz, outline);
+  drawSegBarCore(cx, cy - 2.0f, len, thick, horiz, outline);
+  drawSegBarCore(cx, cy + 2.0f, len, thick, horiz, outline);
+  drawSegBarCore(cx - 1.4f, cy - 1.4f, len, thick, horiz, outline);
+  drawSegBarCore(cx + 1.4f, cy - 1.4f, len, thick, horiz, outline);
+  drawSegBarCore(cx - 1.4f, cy + 1.4f, len, thick, horiz, outline);
+  drawSegBarCore(cx + 1.4f, cy + 1.4f, len, thick, horiz, outline);
+  drawSegBarCore(cx, cy, len, thick, horiz, lit);
+}
+
+void drawSevenSegment(int x, int y, int w, int h, int digit, uint16_t lit) {
   static const uint8_t segs[10] = {
     0b0111111, // 0
     0b0000110, // 1
@@ -1928,21 +2075,91 @@ void drawSevenSegment(int x, int y, int w, int h, int digit, uint16_t c) {
     0b1101111  // 9
   };
   if (digit < 0 || digit > 9) return;
-  int t = max(8, w / 7);
-  int mid = y + h / 2;
+  float t = max(w * 0.105f, h * 0.064f);
+  t = max(t, 12.0f);
+  float gap = t * 1.55f;
+  float mid = y + h * 0.5f;
+  float overlap = t * 0.36f;
+  float hLen = w - 2.0f * gap + overlap * 2.0f;
+  float vLen = h * 0.5f - 2.0f * gap + overlap * 2.0f;
   uint8_t s = segs[digit];
-  auto segLine = [&](int bit, int x0, int y0, int x1, int y1) {
-    if (!(s & (1 << bit))) return;
-    wideLine(x0, y0, x1, y1, t, c);   // 只画本体颜色，无黑色描边
+  auto seg = [&](int bit, float cx, float cy, float len, bool horiz) {
+    drawSegBar(cx, cy, len, t, horiz, (s & (1 << bit)), lit);
   };
-  segLine(0, x + t, y, x + w - t, y);             // A
-  segLine(1, x + w, y + t, x + w, mid - t);       // B
-  segLine(2, x + w, mid + t, x + w, y + h - t);   // C
-  segLine(3, x + t, y + h, x + w - t, y + h);     // D
-  segLine(4, x, mid + t, x, y + h - t);           // E
-  segLine(5, x, y + t, x, mid - t);               // F
-  segLine(6, x + t, mid, x + w - t, mid);         // G
+  seg(0, x + w * 0.5f, y + gap,                 hLen, true);
+  seg(1, x + w - gap,   y + h * 0.255f,         vLen, false);
+  seg(2, x + w - gap,   y + h * 0.745f,         vLen, false);
+  seg(3, x + w * 0.5f, y + h - gap,             hLen, true);
+  seg(4, x + gap,       y + h * 0.745f,         vLen, false);
+  seg(5, x + gap,       y + h * 0.255f,         vLen, false);
+  seg(6, x + w * 0.5f, mid,                     hLen, true);
 }
+
+// 7 列 × 10 行 点阵字模(每个数字 70 位，行优先)，1=点亮
+// 高分辨率粗黑体，贴近真实 LED 记分牌大屏，识别性强
+static const uint16_t DOT_MATRIX[10][10] = {
+  // 0
+  {0b0111110, 0b1111111, 0b1100011, 0b1100011, 0b1100011, 0b1100011, 0b1100011, 0b1100011, 0b1111111, 0b0111110},
+  // 1
+  {0b0001100, 0b0011100, 0b0111100, 0b0001100, 0b0001100, 0b0001100, 0b0001100, 0b0001100, 0b0001100, 0b1111111},
+  // 2
+  {0b0111110, 0b1111111, 0b0000011, 0b0000110, 0b0001100, 0b0011000, 0b0110000, 0b1100000, 0b1111111, 0b1111111},
+  // 3
+  {0b1111110, 0b1111111, 0b0000011, 0b0000110, 0b0011110, 0b0000110, 0b0000011, 0b0000011, 0b1111111, 0b1111100},
+  // 4
+  {0b0001110, 0b0011110, 0b0110110, 0b1100110, 0b1100110, 0b1111111, 0b1111111, 0b0000110, 0b0000110, 0b0000110},
+  // 5
+  {0b1111111, 0b1111111, 0b1100000, 0b1100000, 0b1111110, 0b0000011, 0b0000011, 0b0000011, 0b1111111, 0b1111100},
+  // 6
+  {0b0011110, 0b0111000, 0b1100000, 0b1100000, 0b1111110, 0b1100011, 0b1100011, 0b1100011, 0b1111111, 0b0111110},
+  // 7
+  {0b1111111, 0b1111111, 0b0000011, 0b0000110, 0b0001100, 0b0011000, 0b0110000, 0b0110000, 0b0110000, 0b0110000},
+  // 8
+  {0b0111110, 0b1111111, 0b1100011, 0b1100011, 0b0111110, 0b1100011, 0b1100011, 0b1100011, 0b1111111, 0b0111110},
+  // 9
+  {0b0111110, 0b1111111, 0b1100011, 0b1100011, 0b0111111, 0b0000011, 0b0000011, 0b0000110, 0b0011100, 0b0111100},
+};
+
+// 画一个点阵 LED 数字：7×10 大圆点，相邻点轻微重叠 + 抗锯齿，边缘圆滑无锯齿。
+// pad=圆点相对格子的收缩(0=刚好相切略有重叠，>0 留缝隙显颗粒感)。
+void drawDotMatrixDigit(int x, int y, int w, int h, int digit, uint16_t lit, float pad = 0.0f) {
+  if (digit < 0 || digit > 9) return;
+  const int COLS = 7, ROWS = 10;
+  float cellW = (float)w / COLS;
+  float cellH = (float)h / ROWS;
+  // 圆点直径取格子较小边，再 +6% 让相邻点重叠、消除断阶；pad 收缩则变稀疏
+  float r = min(cellW, cellH) * (0.53f - pad);
+  for (int row_i = 0; row_i < ROWS; ++row_i) {
+    uint16_t row = DOT_MATRIX[digit][row_i];
+    for (int c = 0; c < COLS; ++c) {
+      if (!(row & (1 << (COLS - 1 - c)))) continue;
+      float cx = x + (c + 0.5f) * cellW;
+      float cy = y + (row_i + 0.5f) * cellH;
+      // fillSmoothCircle 自带抗锯齿，边缘柔和
+      if (useCanvas) canvas.fillSmoothCircle((int)cx, (int)cy, (int)r, lit);
+      else M5.Display.fillSmoothCircle((int)cx, (int)cy, (int)r, lit);
+    }
+  }
+}
+
+// 在两个 RGB565 颜色间线性插值。t∈[0,1]：0=c0, 1=c1。
+// 先拆回 565 再线性混合，避免直接按位运算导致色阶跳变。
+static inline uint16_t lerpRGB565(uint16_t c0, uint16_t c1, float t) {
+  if (t <= 0.0f) return c0;
+  if (t >= 1.0f) return c1;
+  int r0 = (c0 >> 11) & 0x1F, g0 = (c0 >> 5) & 0x3F, b0 = c0 & 0x1F;
+  int r1 = (c1 >> 11) & 0x1F, g1 = (c1 >> 5) & 0x3F, b1 = c1 & 0x1F;
+  int r = r0 + (int)((r1 - r0) * t);
+  int g = g0 + (int)((g1 - g0) * t);
+  int b = b0 + (int)((b1 - b0) * t);
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+// 高亮过渡时长(毫秒)：渐显 + 保持 + 渐隐 = 总 3s
+#define SCORE_FADE_IN_MS   400
+#define SCORE_HOLD_MS     2200
+#define SCORE_FADE_OUT_MS 400
+#define SCORE_TOTAL_MS    (SCORE_FADE_IN_MS + SCORE_HOLD_MS + SCORE_FADE_OUT_MS)
 
 void drawBasketScoreBehindHoop() {
   char score[6];
@@ -1952,66 +2169,69 @@ void drawBasketScoreBehindHoop() {
     memmove(score, score + len - 3, 4);
     len = 3;
   }
-  // 数字等比缩小(高 320→220，比例 0.6875)
-  int digitH = 220;
-  int gap = 48;                                   // 数字间距
-  int digitW = (len >= 3) ? 82 : 103;             // 120×0.6875≈82, 150×0.6875≈103
+  // 点阵 LED：7列×10行，外框尺寸(宽高比 ≈ 0.7)
+  int digitH = 280;
+  int gap = 24;
+  int digitW = (len >= 3) ? 108 : 168;       // 7列，宽 = 高×0.6 左右
   int totalW = len * digitW + (len - 1) * gap;
   int x = screenW / 2 - totalW / 2;
-  int y = (screenH - digitH) / 2 - 4 - 40;          // 往上移动40px
-  // 白色 60% 透明度(255×0.6≈153，保持蓝灰色调按比例缩放)
-  uint16_t translucentWhite = rgb565(153, 163, 172);
+  int y = (screenH - digitH) / 2 - 34;
+  // 记分牌配色(渐变高亮)
+  // 渐变高亮：暗灰 →(0.4s)→ 亮黄 →(2.2s)→ 亮黄 →(0.4s)→ 暗灰
+  const uint16_t cDim = rgb565(0x1A, 0x1A, 0x1A);   // #1A1A1A 近黑深灰(常态)
+  const uint16_t cHot = rgb565(255, 220, 90);       // 暖黄(高亮)
+  uint16_t lit;
+  if (basketScoreHighlightUntil != 0) {
+    uint32_t elapsed = millis() - (basketScoreHighlightUntil - SCORE_TOTAL_MS);
+    if (elapsed >= SCORE_TOTAL_MS) {
+      basketScoreHighlightUntil = 0;                // 过期清零
+      lit = cDim;
+    } else if (elapsed < SCORE_FADE_IN_MS) {
+      lit = lerpRGB565(cDim, cHot, (float)elapsed / SCORE_FADE_IN_MS);        // 渐显
+    } else if (elapsed < SCORE_FADE_IN_MS + SCORE_HOLD_MS) {
+      lit = cHot;                                   // 保持全亮
+    } else {
+      uint32_t fe = elapsed - SCORE_FADE_IN_MS - SCORE_HOLD_MS;
+      lit = lerpRGB565(cHot, cDim, (float)fe / SCORE_FADE_OUT_MS);            // 渐隐
+    }
+  } else {
+    lit = cDim;
+  }
   for (int i = 0; i < len; ++i) {
-    drawSevenSegment(x + i * (digitW + gap), y, digitW, digitH, score[i] - '0', translucentWhite);
+    drawDotMatrixDigit(x + i * (digitW + gap), y, digitW, digitH, score[i] - '0', lit);
   }
 }
 
 void drawBasketGame() {
   uint16_t bg = C_BLACK;
   fillScreen(bg);
-  box(0, screenH - 132, screenW, 132, rgb565(188, 118, 56));
-  wideLine(0, screenH - 132, screenW, screenH - 132, 4, rgb565(238, 214, 164));
-  rectLine(screenW / 2 - 72, screenH - 126, 144, 116, rgb565(238, 214, 164));
-  circle(screenW / 2, screenH - 68, 36, rgb565(238, 214, 164));
-  box(screenW / 2 - 34, screenH - 126, 68, 4, rgb565(238, 214, 164));
 
   drawBasketScoreBehindHoop();
   drawBasketHoop();
 
-  int meterW = 126;
-  int meterX = screenW / 2 - meterW / 2;
-  int meterY = screenH - 38;
-  roundBox(meterX, meterY, meterW, 12, 6, rgb565(48, 56, 62));
-  box(meterX + 3, meterY + 3, (int)((meterW - 6) * clampf(basketSwingMeter, 0.0f, 1.0f)), 6, C_YELLOW);
-
   textLeft("AIR SHOT", 12, 10, &fonts::Font4, C_WHITE, bg);
   char buf[48];
   snprintf(buf, sizeof(buf), "%d/%d", basketMade, basketAttempts);
-  textLeft("MADE", screenW - 82, 46, &fonts::Font0, C_DIM, bg);
-  textLeft(buf, screenW - 82, 58, &fonts::Font2, C_WHITE, bg);
+  textCenter("MADE", screenW / 2, 8, &fonts::Font0, C_DIM, bg);
+  textCenter(buf, screenW / 2, 31, &fonts::Font4, C_WHITE, bg);
   textLeft("B=MENU", screenW - 74, 12, &fonts::Font0, C_WHITE, bg);
 
-  if (!basketShotActive) {
-    drawBasketBall((int)basketBallX, (int)basketBallY, (int)basketBallR);
-  }
-  if (basketShotActive) {
-    for (float t = 0.15f; t < min(1.0f, basketBallT); t += 0.18f) {
-      float u = 1.0f - t;
-      int px = (int)(u * u * basketStartX + 2.0f * u * t * basketCtrlX + t * t * basketEndX);
-      int py = (int)(u * u * basketStartY + 2.0f * u * t * basketCtrlY + t * t * basketEndY);
-      circle(px, py, 2, rgb565(255, 228, 150));
-    }
-    drawBasketBall((int)basketBallX, (int)basketBallY, max(5, (int)basketBallR));
-  }
-
-  if (basketResultReady) {
-    const char* result = basketShotMade ? "SWISH!" : "MISS";
-    uint16_t bg = basketShotMade ? rgb565(242, 174, 38) : rgb565(72, 78, 88);
-    roundBox(screenW / 2 - 78, 190, 156, 48, 8, bg);
-    textCenter(result, screenW / 2, 214, &fonts::Font4, C_WHITE, bg);
+  int statusY = screenH - 38;
+  // 进球(SWISH)显示时长跟随分数高亮：resultReady 期间 + 高亮 3s 期间都显示；
+  // 未进(MISS)显示时长与 SWISH 一致(独立计时，不影响用户继续投篮)。
+  bool highlight = basketScoreHighlightUntil != 0 && millis() < basketScoreHighlightUntil;
+  bool missShow = basketMissShowUntil != 0 && millis() < basketMissShowUntil;
+  if (!highlight && basketScoreHighlightUntil != 0) basketScoreHighlightUntil = 0;   // 过期清零
+  if (!missShow && basketMissShowUntil != 0) basketMissShowUntil = 0;                // 过期清零
+  bool swish = basketShotMade && (basketResultReady || highlight);
+  bool miss = !basketShotMade && (basketResultReady || missShow);
+  if (swish) {
+    textCenter("SWISH!", screenW / 2, statusY, &fonts::Font4, rgb565(242, 174, 38), bg);
+  } else if (miss) {
+    textCenter("MISS", screenW / 2, statusY, &fonts::Font4, rgb565(150, 160, 170), bg);
   } else if (!basketShotActive) {
     const char* hint = basketImuReady ? "Swing to shoot" : "Tap / A to shoot";
-    textCenter(hint, screenW / 2, 306, &fonts::Font2, C_WHITE, bg);
+    textCenter(hint, screenW / 2, statusY, &fonts::Font4, rgb565(51, 51, 51), bg);  // 20% 白(与黑底混合)
   }
 
   pushFrame();
@@ -2027,6 +2247,37 @@ void drawBoot() {
 }
 
 // ---- 菜单绘制 ----
+// 选车页：单辆轮播，中央大图
+void drawCarSelect() {
+  fillScreen(rgb565(20, 24, 32));
+  // 标题
+  textCenter("SELECT YOUR CAR", screenW / 2, 50, &fonts::Font4, C_YELLOW, rgb565(20, 24, 32));
+  // 左右箭头
+  uint16_t arrowC = rgb565(120, 130, 150);
+  if (carSelectIndex > 0) textCenter("<<", 40, screenH / 2, &fonts::Font4, arrowC, rgb565(20, 24, 32));
+  if (carSelectIndex < 8) textCenter(">>", screenW - 40, screenH / 2, &fonts::Font4, arrowC, rgb565(20, 24, 32));
+  // 中央大图(选中边框 + 车辆精灵)
+  int previewSize = 160;
+  int cx = screenW / 2;
+  int cy = screenH / 2 + 10;
+  if (carSelectConfirmed) {
+    // 已选中：高亮边框
+    rectLine(cx - previewSize / 2 - 8, cy - previewSize / 2 - 8, previewSize + 16, previewSize + 16, C_ACCENT);
+  }
+  drawCarPreview(carSelectIndex, cx, cy, previewSize);
+  // 编号
+  char buf[24];
+  snprintf(buf, sizeof(buf), "Type %d / 8", carSelectIndex);
+  textCenter(buf, cx, cy + previewSize / 2 + 24, &fonts::Font2, C_WHITE, rgb565(20, 24, 32));
+  // 底部提示
+  if (carSelectConfirmed) {
+    textCenter("Press A to START", screenW / 2, screenH - 30, &fonts::Font2, C_YELLOW, rgb565(20, 24, 32));
+  } else {
+    textCenter("Touch < left / right >  A = start", screenW / 2, screenH - 30, &fonts::Font0, C_DIM, rgb565(20, 24, 32));
+  }
+  pushFrame();
+}
+
 void drawMenu() {
   fillScreen(rgb565(20, 24, 32));
   // 标题
@@ -2046,7 +2297,7 @@ void drawMenu() {
     roundBox(cx, cardY, cardW, cardH, 8, bg);
     rectLine(cx, cardY, cardW, cardH, edge);
     const char* name = (i == 0) ? "FOOTBALL" : (i == 1 ? "RACING" : "AIR SHOT");
-    textCenter(name, cx + cardW / 2, cardY + cardH / 2 - 6, (i == 2 ? &fonts::Font2 : &fonts::Font4),
+    textCenter(name, cx + cardW / 2, cardY + cardH / 2 + 14, &fonts::Font4,   // 标题下移 20px(原 -6)
                sel ? C_WHITE : C_DIM, bg);
     // 简易图标提示
     if (i == 0) {
@@ -2071,7 +2322,7 @@ void setup() {
   auto cfg = M5.config();
   cfg.fallback_board = m5::board_t::board_M5StopWatch;
   cfg.serial_baudrate = 115200;
-  cfg.internal_spk = false;
+  cfg.internal_spk = true;
   cfg.internal_mic = false;
   cfg.internal_imu = true;
   cfg.internal_rtc = false;
@@ -2086,6 +2337,12 @@ void setup() {
   M5.Display.setBrightness(190);
   M5.Display.setColorDepth(16);
   M5.Display.fillScreen(C_BLACK);
+
+  auto spkCfg = M5.Speaker.config();
+  spkCfg.magnification = 24;
+  M5.Speaker.config(spkCfg);
+  speakerReady = M5.Speaker.begin();
+  if (speakerReady) M5.Speaker.setVolume(255);
   canvas.setColorDepth(16);
   useCanvas = canvas.createSprite(screenW, screenH) != nullptr;
   if (!useCanvas) M5.Display.fillScreen(C_BLACK);
@@ -2111,9 +2368,10 @@ void setup() {
   startMatchClock();
   gameMode = MODE_MENU;   // 开机进菜单选择游戏
 
-  Serial.printf("[Boot] display=%dx%d canvas=%s touch=%s keyA_idle=%d keyB_idle=%d\n",
+  Serial.printf("[Boot] display=%dx%d canvas=%s touch=%s speaker=%s keyA_idle=%d keyB_idle=%d\n",
                 screenW, screenH, useCanvas ? "ok" : "off",
                 M5.Touch.isEnabled() ? "ok" : "off",
+                speakerReady ? "ok" : "off",
                 rawA.idleLevel, rawB.idleLevel);
 }
 
@@ -2124,6 +2382,12 @@ void loop() {
 
   bool passPressed = rawA.pressed || M5.BtnA.wasPressed();
   bool shootPressed = rawB.pressed || M5.BtnB.wasPressed();
+  // A+B 同时按住 → 返回菜单(任何游戏状态下)
+  if (gameMode != MODE_MENU && M5.BtnA.isPressed() && M5.BtnB.isPressed()) {
+    gameMode = MODE_MENU;
+    passPressed = false;
+    shootPressed = false;
+  }
 
   uint32_t now = millis();
   float dt = (now - lastTickMs) / 1000.0f;
@@ -2131,15 +2395,36 @@ void loop() {
   dt = clampf(dt, 0.0f, 0.040f);
 
   if (gameMode == MODE_MENU) {
-    // 菜单：触摸左/右选游戏，A 确认
+    // 菜单：触摸点选(点哪个卡片进哪个游戏)，A 确认当前选中
+    bool touchTapped = false;
+    int tapIdx = -1;
     if (M5.Touch.isEnabled() && M5.Touch.getCount() > 0) {
       auto& pt = M5.Touch.getTouchPointRaw(0);
       Vec2 tp = touchToScreen(pt.x, pt.y);
+      // 触摸滑动选择(跟随 x 位置)
       menuSelected = clampf(tp.x / (screenW / (float)GAME_COUNT), 0.0f, (float)(GAME_COUNT - 1));
+      // 判断触摸点是否落在某个卡片范围内 → 点击进入
+      const int cardW = 134, cardH = 186, gap = 14;
+      int totalW = cardW * GAME_COUNT + gap * (GAME_COUNT - 1);
+      int startX = (screenW - totalW) / 2;
+      int cardY = 142;
+      for (int i = 0; i < GAME_COUNT; ++i) {
+        int cx = startX + i * (cardW + gap);
+        if (tp.x >= cx && tp.x < cx + cardW && tp.y >= cardY && tp.y < cardY + cardH) {
+          tapIdx = i;
+          menuSelected = i;   // 同时选中该卡片
+          break;
+        }
+      }
     }
+    bool enterGame = passPressed;   // A 键进入
     if (shootPressed) menuSelected = (menuSelected + 1) % GAME_COUNT;  // B 切换
-    if (passPressed) {
-      if (menuSelected == 0) {
+    // 触摸点击卡片也进入(用 tapIdx 触发，需配合点击判定)
+    // 简化：触摸点在卡片内时直接进入，避免复杂 tap 检测
+    if (tapIdx >= 0) enterGame = true;
+    if (enterGame) {
+      int sel = (int)menuSelected;
+      if (sel == 0) {
         // 进足球
         resetKickoff(true);
         matchPhase = PH_FIRST_HALF;
@@ -2147,10 +2432,12 @@ void loop() {
         playerScore = 0; cpuScore = 0;
         startMatchClock();
         gameMode = MODE_FOOTBALL;
-      } else if (menuSelected == 1) {
-        // 进赛车
-        racingInit();
-        gameMode = MODE_RACING;
+      } else if (sel == 1) {
+        // 进赛车：先选车
+        carSelectIndex = 0;
+        carSelectConfirmed = false;
+        carSelectTouchPrev = true;   // 标记当前正在触摸，避免进入选车页立刻触发
+        gameMode = MODE_CAR_SELECT;
       } else {
         // 进空气投篮
         basketInit();
@@ -2158,6 +2445,50 @@ void loop() {
       }
     }
     drawMenu();
+    delay(16);
+    return;
+  }
+
+  if (gameMode == MODE_CAR_SELECT) {
+    // 选车页：边沿触发(只在触摸刚按下那帧响应)，避免持续触摸连续触发
+    bool touchActive = (M5.Touch.isEnabled() && M5.Touch.getCount() > 0);
+    bool touchJustPressed = touchActive && !carSelectTouchPrev;   // 边沿：未按→按下
+    carSelectTouchPrev = touchActive;   // 更新状态供下一帧
+    if (touchJustPressed) {
+      auto& pt = M5.Touch.getTouchPointRaw(0);
+      Vec2 tp = touchToScreen(pt.x, pt.y);
+      int centerX = screenW / 2;
+      int previewSize = 160;
+      // 中央大图区域 → 选中/开始
+      if (tp.x > centerX - previewSize / 2 && tp.x < centerX + previewSize / 2 &&
+          tp.y > screenH / 2 - previewSize / 2 && tp.y < screenH / 2 + previewSize / 2) {
+        if (!carSelectConfirmed) {
+          carSelectConfirmed = true;   // 第一次点：选中
+        } else {
+          // 第二次点同一辆：开始
+          racingSetPlayerCarType(carSelectIndex);
+          racingInit();
+          gameMode = MODE_RACING;
+        }
+      } else if (tp.x < centerX - previewSize / 2) {
+        // 左半屏：切换到上一辆
+        if (carSelectIndex > 0) { carSelectIndex--; carSelectConfirmed = false; }
+      } else if (tp.x > centerX + previewSize / 2) {
+        // 右半屏：切换到下一辆
+        if (carSelectIndex < 8) { carSelectIndex++; carSelectConfirmed = false; }
+      }
+    }
+    // A 键：已选中则开始，否则选中当前
+    if (passPressed) {
+      if (carSelectConfirmed) {
+        racingSetPlayerCarType(carSelectIndex);
+        racingInit();
+        gameMode = MODE_RACING;
+      } else {
+        carSelectConfirmed = true;
+      }
+    }
+    drawCarSelect();
     delay(16);
     return;
   }
