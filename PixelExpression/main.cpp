@@ -80,6 +80,30 @@ static int menuSelected = 0;        // 菜单当前选中项 0=足球 1=赛车 2
 static int carSelectIndex = 0;     // 选车页当前轮播索引 0~8
 static bool carSelectConfirmed = false;  // 是否已选中(等待二次确认开始)
 static bool carSelectTouchPrev = false;  // 上一帧触摸状态(边沿触发防误触)
+static int  carSelectSwipeStartX = -1;    // 滑动起点 x(-1=未按下)
+static int  carSelectSwipeStartY = -1;    // 滑动起点 y
+#define CAR_SWIPE_THRESHOLD  40           // 滑动判定阈值(像素)
+static float carSelectOffset = 0.0f;     // 车辆图实时 x 偏移(触摸中跟随手指，松开后回弹/过渡)
+static bool  carSelectDragging = false;  // 是否正在拖动(触摸中)
+// 切换过渡动画：从 prevIndex 滑出，carSelectIndex 滑入
+static int   carSelectPrevIndex = 0;     // 切换前的车型(动画中滑出)
+static float carSelectTransT = 1.0f;     // 过渡进度 0→1(1=完成)
+static int   carSelectTransDir = 0;      // 切换方向: -1=新车从右滑入(左滑切换), +1=新车从左滑入(右滑切换)
+static int   carSelectLastX = 0;        // 最后触摸 x(松开时判断短按 vs 滑动)
+static bool  carSelectSwipeUsed = false;   // 本次手势是否已切换过(一次手势只切一辆)
+static float carSelectPos = 0.0f;        // 浮点选中位置(动画期间从 prevIndex 平滑过渡到 carSelectIndex)
+// 9 辆车的名字(按车型顺序)
+static const char* const CAR_NAMES[9] = {
+  "Suzuki Swift",     // 0
+  "BMW 3 Series",     // 1
+  "Suzuki Vitara",    // 2
+  "Jeep Wrangler",    // 3 (玩家默认)
+  "Ford F-150",       // 4
+  "Citroen Jumper",   // 5 (去掉变音符便于显示)
+  "Porsche 718",      // 6
+  "Renault Duster",   // 7
+  "Fiat 500",         // 8
+};
 
 static int fieldLeft = 20;
 static int fieldRight = 448;
@@ -457,6 +481,10 @@ extern "C" {
     if (useCanvas) canvas.drawPixel(x, y, c);
     else M5.Display.drawPixel(x, y, c);
   }
+  uint16_t gfxReadPixel(int x, int y) {
+    if (useCanvas) return (uint16_t)canvas.readPixel(x, y);
+    return (uint16_t)M5.Display.readPixel(x, y);
+  }
   void gfxRoundBox(int x, int y, int w, int h, int r, uint16_t c) { roundBox(x, y, w, h, r, c); }
   void gfxRectLine(int x, int y, int w, int h, uint16_t c) { rectLine(x, y, w, h, c); }
   void gfxLine(int x0, int y0, int x1, int y1, uint16_t c) { line(x0, y0, x1, y1, c); }
@@ -520,6 +548,22 @@ extern "C" {
       canvas.drawString(s, x, y);
     } else {
       M5.Display.setFont(&fonts::Font4);
+      M5.Display.setTextSize(size);
+      M5.Display.setTextDatum(textdatum_t::middle_center);
+      M5.Display.setTextColor(c, (bg == 0xFFFF) ? c : bg);
+      M5.Display.drawString(s, x, y);
+    }
+  }
+  // 矢量字体(DejaVu24，抗锯齿清晰) + size 放大，正常大粗体
+  void gfxTextCenterBold(const char* s, int x, int y, int size, uint16_t c, uint16_t bg) {
+    if (useCanvas) {
+      canvas.setFont(&fonts::DejaVu24);
+      canvas.setTextSize(size);
+      canvas.setTextDatum(textdatum_t::middle_center);
+      canvas.setTextColor(c, (bg == 0xFFFF) ? c : bg);
+      canvas.drawString(s, x, y);
+    } else {
+      M5.Display.setFont(&fonts::DejaVu24);
       M5.Display.setTextSize(size);
       M5.Display.setTextDatum(textdatum_t::middle_center);
       M5.Display.setTextColor(c, (bg == 0xFFFF) ? c : bg);
@@ -2251,30 +2295,41 @@ void drawBoot() {
 void drawCarSelect() {
   fillScreen(rgb565(20, 24, 32));
   // 标题
-  textCenter("SELECT YOUR CAR", screenW / 2, 50, &fonts::Font4, C_YELLOW, rgb565(20, 24, 32));
-  // 左右箭头
-  uint16_t arrowC = rgb565(120, 130, 150);
-  if (carSelectIndex > 0) textCenter("<<", 40, screenH / 2, &fonts::Font4, arrowC, rgb565(20, 24, 32));
-  if (carSelectIndex < 8) textCenter(">>", screenW - 40, screenH / 2, &fonts::Font4, arrowC, rgb565(20, 24, 32));
-  // 中央大图(选中边框 + 车辆精灵)
+  textCenter("SELECT YOUR CAR", screenW / 2, 70, &fonts::Font4, rgb565(0x3C, 0x3E, 0x46), rgb565(20, 24, 32));
+  // 画廊渲染：用浮点选中位置 carSelectPos 驱动所有车的位置和大小。
+  // 每辆车的屏幕 x = cx + (车索引 - carSelectPos) × 间距
+  // 大小按距中央的距离衰减：中央 160，每离一格减到 75%
   int previewSize = 160;
+  int spacing = screenW * 45 / 100;   // 相邻车中心的间距
   int cx = screenW / 2;
   int cy = screenH / 2 + 10;
-  if (carSelectConfirmed) {
-    // 已选中：高亮边框
-    rectLine(cx - previewSize / 2 - 8, cy - previewSize / 2 - 8, previewSize + 16, previewSize + 16, C_ACCENT);
+  float pos = carSelectPos;   // 当前浮点位置(如 3.0 = 车3在中央)
+
+  // 先画车名(在底层)，再画车(覆盖在文字上)，让车辆遮挡文字底部
+  const char* carName = (carSelectIndex >= 0 && carSelectIndex <= 8) ? CAR_NAMES[carSelectIndex] : "?";
+  gfxTextCenterBold(carName, cx, cy - previewSize / 2 + 20, 2, rgb565(153, 153, 153), 0xFFFF);
+
+  // 画可见范围内的车(carSelectPos-2 到 +2)，覆盖在车名上方
+  for (int i = -2; i <= 2; ++i) {
+    int carIdx = (int)roundf(pos) + i;
+    if (carIdx < 0 || carIdx > 8) continue;
+    float relPos = (float)carIdx - pos;   // 相对中央的距离(负=左，正=右)
+    int x = cx + (int)(relPos * spacing);
+    // 大小衰减：中央(距离0)=160，距离1=120，距离2=84
+    float dist = fabsf(relPos);
+    int size = (int)(previewSize * (1.0f - 0.25f * dist));
+    if (size < 50) continue;   // 太小不画
+    drawCarPreview(carIdx, x, cy, size);
   }
-  drawCarPreview(carSelectIndex, cx, cy, previewSize);
-  // 编号
-  char buf[24];
-  snprintf(buf, sizeof(buf), "Type %d / 8", carSelectIndex);
-  textCenter(buf, cx, cy + previewSize / 2 + 24, &fonts::Font2, C_WHITE, rgb565(20, 24, 32));
-  // 底部提示
-  if (carSelectConfirmed) {
-    textCenter("Press A to START", screenW / 2, screenH - 30, &fonts::Font2, C_YELLOW, rgb565(20, 24, 32));
-  } else {
-    textCenter("Touch < left / right >  A = start", screenW / 2, screenH - 30, &fonts::Font0, C_DIM, rgb565(20, 24, 32));
-  }
+  // GO 按钮(车型下方)：大圆角描边 2px，黄色文字居中，上移 20px
+  int goW = 160, goH = 60;   // 宽度 180→160 (两边各缩 10)
+  int goX = cx - goW / 2;
+  int goY = cy + previewSize / 2 + 30;   // 原 50 → 30，上移 20px
+  // 全圆角(胶囊形)描边：外框黄 + 内框背景色，形成 2px 圆角描边
+  uint16_t bgC = rgb565(20, 24, 32);
+  roundBox(goX, goY, goW, goH, 100, C_YELLOW);          // 外框(黄，圆角自动钳制到 goH/2)
+  roundBox(goX + 2, goY + 2, goW - 4, goH - 4, 100, bgC); // 内框(背景色，留 2px 黄边)
+  textCenter("GO", cx, goY + goH / 2 + 2, &fonts::Font4, C_YELLOW, bgC);
   pushFrame();
 }
 
@@ -2436,7 +2491,12 @@ void loop() {
         // 进赛车：先选车
         carSelectIndex = 0;
         carSelectConfirmed = false;
-        carSelectTouchPrev = true;   // 标记当前正在触摸，避免进入选车页立刻触发
+        carSelectTouchPrev = true;   // 标记当前正在触摸，避免立刻触发
+        carSelectSwipeStartX = -1;   // 无效起点，必须真正按下(touchJustPressed)才生效
+        carSelectSwipeStartY = -1;
+        carSelectLastX = -1;
+        carSelectSwipeUsed = false;
+        carSelectPos = 0.0f;   // 从车 0 开始
         gameMode = MODE_CAR_SELECT;
       } else {
         // 进空气投篮
@@ -2450,43 +2510,70 @@ void loop() {
   }
 
   if (gameMode == MODE_CAR_SELECT) {
-    // 选车页：边沿触发(只在触摸刚按下那帧响应)，避免持续触摸连续触发
+    // 选车页：滑动切换车辆，点击车/A键 直接进入游戏
     bool touchActive = (M5.Touch.isEnabled() && M5.Touch.getCount() > 0);
-    bool touchJustPressed = touchActive && !carSelectTouchPrev;   // 边沿：未按→按下
-    carSelectTouchPrev = touchActive;   // 更新状态供下一帧
+    bool touchJustPressed = touchActive && !carSelectTouchPrev;
+    bool touchJustReleased = !touchActive && carSelectTouchPrev;
+    carSelectTouchPrev = touchActive;
+
+    // 按下：记录起点，重置切换标记
     if (touchJustPressed) {
       auto& pt = M5.Touch.getTouchPointRaw(0);
       Vec2 tp = touchToScreen(pt.x, pt.y);
-      int centerX = screenW / 2;
-      int previewSize = 160;
-      // 中央大图区域 → 选中/开始
-      if (tp.x > centerX - previewSize / 2 && tp.x < centerX + previewSize / 2 &&
-          tp.y > screenH / 2 - previewSize / 2 && tp.y < screenH / 2 + previewSize / 2) {
-        if (!carSelectConfirmed) {
-          carSelectConfirmed = true;   // 第一次点：选中
-        } else {
-          // 第二次点同一辆：开始
+      carSelectSwipeStartX = tp.x;
+      carSelectSwipeStartY = tp.y;
+      carSelectLastX = tp.x;
+      carSelectSwipeUsed = false;   // 新手势，允许切换一次
+    }
+    // 拖动中：每超过阈值切换一辆，启动过渡动画
+    if (touchActive) {
+      auto& pt = M5.Touch.getTouchPointRaw(0);
+      Vec2 tp = touchToScreen(pt.x, pt.y);
+      carSelectLastX = tp.x;
+      int dx = tp.x - carSelectSwipeStartX;
+      // 一次手势只切一辆：用 swipeUsed 锁定，必须松开才能切下一辆
+      if (!carSelectSwipeUsed && dx > CAR_SWIPE_THRESHOLD && carSelectIndex > 0) {
+        carSelectPrevIndex = carSelectIndex;
+        carSelectPos = (float)carSelectPrevIndex;   // 动画起点
+        carSelectIndex--;
+        carSelectTransDir = 1; carSelectTransT = 0.0f;
+        carSelectSwipeUsed = true;
+      } else if (!carSelectSwipeUsed && dx < -CAR_SWIPE_THRESHOLD && carSelectIndex < 8) {
+        carSelectPrevIndex = carSelectIndex;
+        carSelectPos = (float)carSelectPrevIndex;   // 动画起点
+        carSelectIndex++;
+        carSelectTransDir = -1; carSelectTransT = 0.0f;
+        carSelectSwipeUsed = true;
+      }
+    }
+    // 松开：判断点击 GO 按钮(起点必须有效，即经过了真正的按下)
+    if (touchJustReleased && carSelectSwipeStartX >= 0) {
+      int totalDx = abs(carSelectLastX - carSelectSwipeStartX);
+      if (totalDx < CAR_SWIPE_THRESHOLD) {
+        // 短按：检查是否落在 GO 按钮区域(与绘制尺寸一致)
+        int goW = 160, goH = 60;
+        int goX = screenW / 2 - goW / 2;
+        int goY = screenH / 2 + 10 + 160 / 2 + 30;   // cy + previewSize/2 + 30(上移20)
+        if (carSelectSwipeStartX >= goX && carSelectSwipeStartX < goX + goW &&
+            carSelectSwipeStartY >= goY && carSelectSwipeStartY < goY + goH) {
+          // 点 GO 按钮 → 进入游戏
           racingSetPlayerCarType(carSelectIndex);
           racingInit();
           gameMode = MODE_RACING;
         }
-      } else if (tp.x < centerX - previewSize / 2) {
-        // 左半屏：切换到上一辆
-        if (carSelectIndex > 0) { carSelectIndex--; carSelectConfirmed = false; }
-      } else if (tp.x > centerX + previewSize / 2) {
-        // 右半屏：切换到下一辆
-        if (carSelectIndex < 8) { carSelectIndex++; carSelectConfirmed = false; }
       }
     }
-    // A 键：已选中则开始，否则选中当前
+    // 推进过渡动画：carSelectPos 从 prevIndex 平滑过渡到 carSelectIndex
+    float targetPos = (float)carSelectIndex;
+    carSelectPos += (targetPos - carSelectPos) * 0.35f;   // 加快滑动速度
+    if (fabsf(targetPos - carSelectPos) < 0.005f) carSelectPos = targetPos;
+    // 同步过渡进度(用于其它逻辑判断，如动画是否完成)
+    carSelectTransT = 1.0f;   // 渲染已改用 carSelectPos，transT 标记为完成
+    // A 键：直接开始赛车
     if (passPressed) {
-      if (carSelectConfirmed) {
-        racingSetPlayerCarType(carSelectIndex);
-        racingInit();
-        gameMode = MODE_RACING;
-      } else {
-        carSelectConfirmed = true;
-      }
+      racingSetPlayerCarType(carSelectIndex);
+      racingInit();
+      gameMode = MODE_RACING;
     }
     drawCarSelect();
     delay(16);
