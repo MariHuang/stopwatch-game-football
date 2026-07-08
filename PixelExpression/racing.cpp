@@ -137,6 +137,7 @@ static int   rLane       = 1;        // 跑酷车道：0=左 1=中 2=右
 static int   rTargetLane = 1;        // 目标车道，rCarX 平滑追随
 static uint32_t rLastLaneChangeMs = 0;
 static bool  rSteerLatch = false;    // 换道锁存：一次触摸只触发一次，回到中性区才复位
+static bool  rSteeringArmed = false;  // 转向待命：游戏开始后等首次触摸松开再响应，避免误触
 static bool  rLaneChangePending = false;  // 换道进行中，到位后再降速(避免转向时卡顿)
 static uint32_t rBoostUntil = 0;
 static bool  rBrakeHeld = false;
@@ -243,6 +244,7 @@ void racingInit() {
   rTargetLane = 1;
   rLastLaneChangeMs = 0;
   rSteerLatch = false;
+  rSteeringArmed = false;   // 游戏开始时未待命，等首次松手
   rLaneChangePending = false;
   rBoostUntil = 0;
   rBrakeHeld = false;
@@ -436,6 +438,13 @@ static void startMeteor() {
 void racingHandleInput(bool accel, bool brake, float steerX) {
   if (rGameOver) return;
   uint32_t now = millis();
+  // 游戏开始后，等触摸先松开(回到中性区)再响应转向，避免从选车页带入手势误触
+  bool touching = (fabsf(steerX) > 0.05f);
+  if (!touching) rSteeringArmed = true;   // 松手后待命
+  if (!rSteeringArmed) {
+    rLane = rTargetLane;
+    return;   // 未待命：忽略转向
+  }
   if (accel) rBoostUntil = now + 650;
   rBrakeHeld = brake;
   // 边沿触发：一次触摸只换一条车道，必须回中性区才能再次触发
@@ -598,6 +607,7 @@ static void racingRestart() {
   rTargetLane = 1;
   rLastLaneChangeMs = 0;
   rSteerLatch = false;
+  rSteeringArmed = false;   // 游戏开始时未待命，等首次松手
   rLaneChangePending = false;
   rBoostUntil = 0;
   rBrakeHeld = false;
@@ -617,6 +627,11 @@ static void racingRestart() {
   rOffTrackUntil = 0;
   for (int i = 0; i < OBSTACLE_MAX; ++i) obstacles[i].active = false;
   for (int i = 0; i < COIN_POP_MAX; ++i) coinPops[i].active = false;
+}
+
+// 入场动画是否进行中
+bool racingIsIntroActive() {
+  return (uint32_t)(millis() - rIntroStartMs) < RACING_INTRO_MS;
 }
 
 // 外部调用：设置退出标志(返回菜单)
@@ -1025,11 +1040,13 @@ static void drawCone(int sx, int baseY, int scale) {
 static void drawCoinSpriteAt(int x0, int y0, int dstH, int clipTop, float alpha = 1.0f) {
   alpha = constrain(alpha, 0.0f, 1.0f);
   if (alpha <= 0.0f) return;
-  const uint16_t fadeBg = RRGB565(18, 15, 44);
-  auto fadePixel = [&](uint16_t c) {
+  // 真正的 alpha 渐隐：读取屏幕当前像素(背景)，金币色向背景过渡
+  auto fadePixel = [&](uint16_t c, int px, int py) {
     if (alpha >= 0.99f) return c;
+    uint16_t bgC = gfxReadPixel(px, py);   // 屏幕当前色(赛道/背景)
     int r = (c >> 11) & 0x1F, g = (c >> 5) & 0x3F, b = c & 0x1F;
-    int br = (fadeBg >> 11) & 0x1F, bg = (fadeBg >> 5) & 0x3F, bb = fadeBg & 0x1F;
+    int br = (bgC >> 11) & 0x1F, bg = (bgC >> 5) & 0x3F, bb = bgC & 0x1F;
+    // alpha=1 完全金币色，alpha=0 完全背景色
     r = br + (int)((r - br) * alpha);
     g = bg + (int)((g - bg) * alpha);
     b = bb + (int)((b - bb) * alpha);
@@ -1046,7 +1063,7 @@ static void drawCoinSpriteAt(int x0, int y0, int dstH, int clipTop, float alpha 
       if (px < 0 || px >= rSW) continue;
       int srcIdx = sy * COIN_SPRITE_W + sxImg;
       if (!pgm_read_byte(&COIN_SPRITE_MASK[srcIdx])) continue;
-      gfxPixel(px, py, fadePixel(pgm_read_word(&COIN_SPRITE_PIXELS[srcIdx])));
+      gfxPixel(px, py, fadePixel(pgm_read_word(&COIN_SPRITE_PIXELS[srcIdx]), px, py));
     }
   }
 }

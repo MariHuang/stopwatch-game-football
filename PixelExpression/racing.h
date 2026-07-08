@@ -21,6 +21,7 @@ void racingHandleInput(bool accel, bool brake, float steerX);
 
 // 赛车游戏是否处于 Game Over 状态
 bool racingIsGameOver();
+bool racingIsIntroActive();   // 入场动画是否进行中
 
 // 重开赛车（Game Over 后由外部按键触发）
 void racingRestartFromExternal();
