@@ -85,6 +85,9 @@ static int   carSelectTransDir = 0;      // 切换方向: -1=新车从右滑入(
 static int   carSelectLastX = 0;        // 最后触摸 x(松开时判断短按 vs 滑动)
 static bool  carSelectSwipeUsed = false;   // 本次手势是否已切换过(一次手势只切一辆)
 static float carSelectPos = 0.0f;        // 浮点选中位置(动画期间从 prevIndex 平滑过渡到 carSelectIndex)
+static int   carNameIndex = 0;         // 车名显示的索引(动画结束后才更新)
+static float carNameAlpha = 1.0f;      // 车名透明度(渐隐渐显)
+static bool  carNameFading = false;    // 车名是否正在渐隐
 // 9 辆车的名字(按车型顺序)
 static const char* const CAR_NAMES[9] = {
   "Suzuki Swift",     // 0
@@ -835,7 +838,7 @@ void drawBoot() {
 void drawCarSelect() {
   fillScreen(rgb565(20, 24, 32));
   // 标题
-  textCenter("SELECT YOUR CAR", screenW / 2, 70, &fonts::Font4, rgb565(0x3C, 0x3E, 0x46), rgb565(20, 24, 32));
+  textCenter("M RACING", screenW / 2, 70, &fonts::Font4, rgb565(0x3C, 0x3E, 0x46), rgb565(20, 24, 32));
   // 画廊渲染：用浮点选中位置 carSelectPos 驱动所有车的位置和大小。
   // 每辆车的屏幕 x = cx + (车索引 - carSelectPos) × 间距
   // 大小按距中央的距离衰减：中央 160，每离一格减到 75%
@@ -846,23 +849,31 @@ void drawCarSelect() {
   float pos = carSelectPos;   // 当前浮点位置(如 3.0 = 车3在中央)
 
   // 先画车名(在底层)，再画车(覆盖在文字上)，让车辆遮挡文字底部
-  const char* carName = (carSelectIndex >= 0 && carSelectIndex <= 8) ? CAR_NAMES[carSelectIndex] : "?";
-  gfxTextCenterBold(carName, cx, cy - previewSize / 2 + 20, 2, rgb565(153, 153, 153), 0xFFFF);
+  const char* carName = (carNameIndex >= 0 && carNameIndex <= 8) ? CAR_NAMES[carNameIndex] : "?";
+  // 车名真正透明：alpha 向背景色(深灰 #14181C)混合，alpha=0 完全融入背景不可见
+  // 背景色 rgb565(20,24,28)，文字色 rgb565(153,153,153)
+  if (carNameAlpha < 0.02f) {
+    // alpha≈0：完全不画(真正透明，不可见)
+  } else {
+    int bgR = 20, bgG = 24, bgB = 28;     // 背景色
+    int fgR = 153, fgG = 153, fgB = 153;  // 文字色(60%白)
+    int r = bgR + (int)((fgR - bgR) * carNameAlpha);
+    int g = bgG + (int)((fgG - bgG) * carNameAlpha);
+    int b = bgB + (int)((fgB - bgB) * carNameAlpha);
+    gfxTextCenterBold(carName, cx, cy - previewSize / 2 + 20, 2, rgb565(r, g, b), rgb565(20, 24, 32));
+  }
 
-  // 画可见范围内的车：动画中(非整数位置)只画 3 辆省性能，静止时画 5 辆
-  bool isAnimating = (fabsf(pos - roundf(pos)) > 0.01f);
-  int rangeStart = isAnimating ? -1 : -2;
-  int rangeEnd   = isAnimating ?  1 :  2;
-  for (int i = rangeStart; i <= rangeEnd; ++i) {
+  // 统一只画 3 辆，动画中用 fast 模式(最近邻，无 pushImage)
+  bool isAnimating = (carSelectAnimT < 1.0f) || carSelectDragging;
+  for (int i = -1; i <= 1; ++i) {
     int carIdx = (int)roundf(pos) + i;
     if (carIdx < 0 || carIdx > 8) continue;
-    float relPos = (float)carIdx - pos;   // 相对中央的距离(负=左，正=右)
+    float relPos = (float)carIdx - pos;
     int x = cx + (int)(relPos * spacing);
-    // 大小衰减：中央(距离0)=160，距离1=120，距离2=84
     float dist = fabsf(relPos);
     int size = (int)(previewSize * (1.0f - 0.25f * dist));
-    if (size < 50) continue;   // 太小不画
-    drawCarPreview(carIdx, x, cy, size);
+    if (size < 50) continue;
+    drawCarPreview(carIdx, x, cy, size, isAnimating);
   }
   // GO 按钮(车型下方)：大圆角描边 2px，黄色文字居中，上移 20px
   int goW = 160, goH = 60;   // 宽度 180→160 (两边各缩 10)
@@ -1015,6 +1026,7 @@ void loop() {
         carSelectLastX = -1;
         carSelectSwipeUsed = false;
         carSelectPos = 0.0f;   // 从车 0 开始
+        carNameIndex = 0;
         gameMode = MODE_CAR_SELECT;
       } else if (sel == 1) {
         // 进空气投篮
@@ -1045,27 +1057,36 @@ void loop() {
       carSelectSwipeUsed = false;   // 重置：本次手势还没切换
     }
 
-    // 拖动中：车辆跟手偏移(视觉反馈)，但不切换 index
+    // 拖动中：超过阈值立即切换(不等松手)，一次手势只切一辆
     if (touchActive && carSelectDragging) {
       auto& pt = M5.Touch.getTouchPointRaw(0);
       Vec2 tp = touchToScreen(pt.x, pt.y);
       carSelectLastX = tp.x;
-      // 视觉跟手：车辆位置随手指偏移，但有阻尼(不会滑过一辆)
-      float dx = (float)(tp.x - carSelectSwipeStartX);
-      // 阻尼：偏移量压缩到 ±0.5 车位以内
-      float visOffset = clampf(-dx / (screenW * 0.45f), -0.5f, 0.5f);
-      // 限制边界(第一辆不能往右拖，最后一辆不能往左拖)
-      if (carSelectIndex == 0 && visOffset > 0) visOffset *= 0.3f;
-      if (carSelectIndex == 8 && visOffset < 0) visOffset *= 0.3f;
-      carSelectPos = (float)carSelectIndex + visOffset;
+      if (!carSelectSwipeUsed) {
+        int dx = tp.x - carSelectSwipeStartX;
+        if (dx > 30 && carSelectIndex > 0) {
+          // 右滑→上一辆，立即启动动画
+          carSelectAnimFrom = carSelectPos;
+          carSelectAnimT = 0.0f;
+          carNameFading = true;   // 启动车名渐隐
+          carSelectIndex--;
+          carSelectSwipeUsed = true;   // 锁定，本次手势不再切
+        } else if (dx < -30 && carSelectIndex < 8) {
+          // 左滑→下一辆，立即启动动画
+          carSelectAnimFrom = carSelectPos;
+          carSelectAnimT = 0.0f;
+          carNameFading = true;   // 启动车名渐隐
+          carSelectIndex++;
+          carSelectSwipeUsed = true;
+        }
+      }
     }
 
-    // 松开：判断切换 或 点击GO
+    // 松开：只判断短按(GO 按钮)
     if (touchJustReleased && carSelectDragging) {
       carSelectDragging = false;
       int totalDx = carSelectLastX - carSelectSwipeStartX;
-      int absDx = abs(totalDx);
-      if (absDx < 25) {
+      if (abs(totalDx) < 25) {
         // 短按：检查 GO 按钮
         int goW = 160, goH = 60;
         int goX = screenW / 2 - goW / 2;
@@ -1076,12 +1097,6 @@ void loop() {
           racingInit();
           gameMode = MODE_RACING;
         }
-      } else {
-        // 滑动：一次只切一辆，启动切换动画
-        carSelectAnimFrom = carSelectPos;   // 动画起点=当前位置
-        carSelectAnimT = 0.0f;              // 重置进度
-        if (totalDx > 0 && carSelectIndex > 0) carSelectIndex--;      // 右滑→上一辆
-        else if (totalDx < 0 && carSelectIndex < 8) carSelectIndex++; // 左滑→下一辆
       }
     }
 
@@ -1094,8 +1109,19 @@ void loop() {
         // ease-out 曲线(开始快结尾缓，比纯线性更自然)
         float e = 1.0f - (1.0f - carSelectAnimT) * (1.0f - carSelectAnimT);
         carSelectPos = carSelectAnimFrom + (carSelectIndex - carSelectAnimFrom) * e;
+        // 车名渐隐：整个动画期间 alpha 从 1→0
+        if (carNameFading) {
+          carNameAlpha = max(0.0f, 1.0f - carSelectAnimT);
+        }
       } else {
         carSelectPos = (float)carSelectIndex;
+        carNameIndex = carSelectIndex;   // 动画结束，车名更新
+        carNameFading = false;   // 停止渐隐
+      }
+      // 非渐隐时：alpha 渐显回 1(慢速，更明显)
+      if (!carNameFading && carNameAlpha < 1.0f) {
+        carNameAlpha += dt * 2.5f;
+        if (carNameAlpha > 1.0f) carNameAlpha = 1.0f;
       }
     }
 

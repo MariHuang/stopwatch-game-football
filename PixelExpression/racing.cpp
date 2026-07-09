@@ -164,6 +164,7 @@ static float rHighScore  = 0.0f;     // 最高分(内存)
 static int   rSceneIdx   = 0;        // 0=城市日间 1=黄昏海边 2=海底隧道 3=城市夜间 4=森林 5=沙漠
 static int   rSceneFrom  = 0;        // 场景过渡起点
 static float rSceneTransT = 1.0f;    // 切场景后的淡入进度
+static int   rDecorYOffset = 0;      // 切场景时装饰层从赛道背后向上升起
 static float rTimeOfDay  = 0.0f;     // 城市日夜过渡值：0=日间 1=夜间
 static bool  rGameOver   = false;
 static bool  rExitFlag   = false;
@@ -361,7 +362,7 @@ static bool addObstacleInLane(int laneIdx, float z) {
       obstacles[i].sizeMul = 1.0f;
       float pace = 0.88f + (float)(rand() % 9) * 0.01f;  // NPC 同向行驶，只比玩家慢一点
       obstacles[i].npcSpeed = max(1.15f, rSpeed * pace);
-      obstacles[i].fixed = (rand() % 10 == 0);   // 10% 概率固定在车道(像金币)
+      obstacles[i].fixed = (rand() % 20 != 0);   // 95% 固定在车道(像金币)，5% 快速后退
       if (obstacles[i].fixed) obstacles[i].npcSpeed = rSpeed;   // 固定=和玩家同速
       return true;
     }
@@ -848,8 +849,8 @@ static void drawForestTree(int x, int baseY, int scale) {
 }
 
 static void drawForestBackground(int horizonY, uint16_t skyC) {
-  int landY = horizonY + 40;
-  gfxBox(0, landY, rSW, rSH - landY, RRGB565(54, 132, 68));
+  int landY = horizonY + 40 + rDecorYOffset;
+  if (landY < rSH) gfxBox(0, max(0, landY), rSW, rSH - max(0, landY), RRGB565(54, 132, 68));
   drawCloud(rSW / 5, horizonY / 3, 9);
   drawCloud(rSW * 3 / 5, horizonY / 4, 8);
   drawCloud(rSW * 4 / 5, horizonY / 3, 7);
@@ -888,9 +889,9 @@ static void drawSeagull(int x, int y, int scale, uint16_t c) {
 }
 
 static void drawDuskBackground(int horizonY) {
-  int seaY = horizonY + 14;
+  int seaY = horizonY + 14 + rDecorYOffset;
   int roadTop = roadBodyTopY();
-  int seaH = max(1, rSH - seaY);
+  int seaH = max(0, rSH - seaY);
   int farSeaH = max(22, roadTop - seaY + 8);
   uint16_t seaTop = RRGB565(30, 130, 238);
   uint16_t seaBot = RRGB565(10, 84, 180);
@@ -931,10 +932,10 @@ static void drawCactus(int x, int baseY, int scale, uint16_t c) {
 }
 
 static void drawDesertBackground(int horizonY) {
-  int sandY = horizonY + 40;
+  int sandY = horizonY + 40 + rDecorYOffset;
   uint16_t sandNear = RRGB565(218, 168, 88);
   uint16_t sandFar = RRGB565(236, 190, 105);
-  gfxBox(0, sandY, rSW, rSH - sandY, sandNear);
+  if (sandY < rSH) gfxBox(0, max(0, sandY), rSW, rSH - max(0, sandY), sandNear);
 
   uint16_t duneFar = RRGB565(238, 178, 82);
   uint16_t duneMid = RRGB565(224, 154, 66);
@@ -978,6 +979,7 @@ static void drawDesertRoadsideCacti() {
   for (const auto& item : cacti) {
     int y, halfW;
     roadGeom(item.t, y, halfW);
+    y += rDecorYOffset;
     int cx = roadCenterX(item.t, halfW);
     int x = cx + item.side * (halfW + item.scale + 8);
     int baseY = y + item.scale * 2;
@@ -1007,21 +1009,21 @@ static void drawUnderwaterBackground(int horizonY) {
   uint16_t rayC = RRGB565(84, 196, 188);
   for (int i = 0; i < 5; ++i) {
     int x = 26 + i * 88;
-    gfxFillTriangle(x, 0, x + 30, 0, x - 38, horizonY + 118, rayC);
+    gfxFillTriangle(x, rDecorYOffset, x + 30, rDecorYOffset, x - 38, horizonY + 118 + rDecorYOffset, rayC);
   }
 
   uint16_t bubble = RRGB565(150, 230, 225);
   for (int i = 0; i < 16; ++i) {
     int x = 18 + ((i * 67 + 13) % (rSW - 36));
-    int y = 22 + ((i * 43 + 9) % max(1, roadBodyTopY() + 80));
+    int y = 22 + ((i * 43 + 9) % max(1, roadBodyTopY() + 80)) + rDecorYOffset;
     int r = 1 + (i % 4);
     gfxDrawCircle(x, y, r, bubble);
     if (r > 2) gfxPixel(x + r - 1, y - r + 1, RRGB565(205, 255, 250));
   }
 
-  drawFishShadow(rSW / 5, horizonY + 18, 6, RRGB565(22, 88, 112), false);
-  drawFishShadow(rSW * 3 / 5, horizonY - 8, 5, RRGB565(18, 78, 100), true);
-  drawFishShadow(rSW * 4 / 5, horizonY + 54, 4, RRGB565(25, 96, 118), false);
+  drawFishShadow(rSW / 5, horizonY + 18 + rDecorYOffset, 6, RRGB565(22, 88, 112), false);
+  drawFishShadow(rSW * 3 / 5, horizonY - 8 + rDecorYOffset, 5, RRGB565(18, 78, 100), true);
+  drawFishShadow(rSW * 4 / 5, horizonY + 54 + rDecorYOffset, 4, RRGB565(25, 96, 118), false);
 }
 
 static void drawUnderwaterTunnelOverlay() {
@@ -1031,6 +1033,7 @@ static void drawUnderwaterTunnelOverlay() {
     float t = 0.18f + i * 0.16f;
     int y, halfW;
     roadGeom(t, y, halfW);
+    y += rDecorYOffset;
     int cx = roadCenterX(t, halfW);
     int ringH = max(8, (int)(halfW * 0.20f));
     int left = max(0, cx - halfW);
@@ -1075,7 +1078,7 @@ static void drawCityBackground(int horizonY, uint16_t skyC, float night) {
     int bh = 28 + ((i * 11) % 38);
     int extraDown = (i < 3) ? 10 : (i == 11 ? 20 : (i == 10 ? 30 : (i == 9 ? 10 : 0)));
     int bx = -10 + i * 42;
-    int baseHY = horizonYAt(bx + bw / 2, SAG2) + SKY_OFFSET;
+    int baseHY = horizonYAt(bx + bw / 2, SAG2) + SKY_OFFSET + rDecorYOffset;
     uint16_t dayB = buildingColor(i, -8);
     uint16_t nightB = RRGB565(24 + (i % 3) * 5, 18 + (i % 4) * 4, 48 + (i % 2) * 8);
     uint16_t b = rLerpColor(dayB, nightB, night);
@@ -1195,12 +1198,6 @@ static void drawSkyAndRoad() {
   };
 
   float mixT = rSceneTransT * rSceneTransT * (3.0f - 2.0f * rSceneTransT);
-  int decorScene = (rSceneTransT < 0.5f) ? rSceneFrom : rSceneIdx;
-  bool forest = (decorScene == 4);
-  bool dusk = (decorScene == 1);
-  bool underwater = (decorScene == 2);
-  bool desert = (decorScene == 5);
-  float night = forest ? 0.0f : ((decorScene == rSceneIdx || rSceneFrom == rSceneIdx) ? rTimeOfDay : sceneNight(decorScene));
   uint16_t skyFrom = sceneSky(rSceneFrom);
   uint16_t skyTo = sceneSky(rSceneIdx);
   uint16_t skyC = rLerpColor(skyFrom, skyTo, mixT);
@@ -1208,22 +1205,48 @@ static void drawSkyAndRoad() {
   uint16_t dashC = rLerpColor(sceneDash(rSceneFrom), sceneDash(rSceneIdx), mixT);
   uint16_t edgeC = rLerpColor(sceneEdge(rSceneFrom, skyFrom), sceneEdge(rSceneIdx, skyTo), mixT);
 
+  auto sceneDecorNight = [&](int scene) -> float {
+    if (scene == 4) return 0.0f;
+    if (scene == rSceneIdx || scene == rSceneFrom) return rTimeOfDay;
+    return sceneNight(scene);
+  };
+  auto drawSceneDecor = [&](int scene, int yOffset) {
+    rDecorYOffset = yOffset;
+    if (scene == 1) drawDuskBackground(horizonY);
+    else if (scene == 5) drawDesertBackground(horizonY);
+    else if (scene == 2) drawUnderwaterBackground(horizonY);
+    else if (scene == 4) drawForestBackground(horizonY, skyC);
+    else drawCityBackground(horizonY, skyC, sceneDecorNight(scene));
+    rDecorYOffset = 0;
+  };
+  auto drawSceneRoadsideDecor = [&](int scene, int yOffset) {
+    rDecorYOffset = yOffset;
+    if (scene == 5) drawDesertRoadsideCacti();
+    if (scene == 2) drawUnderwaterTunnelOverlay();
+    rDecorYOffset = 0;
+  };
+
   gfxBox(0, 0, rSW, rSH, skyC);
-  if (dusk) drawDuskBackground(horizonY);
-  else if (desert) drawDesertBackground(horizonY);
-  else if (underwater) drawUnderwaterBackground(horizonY);
-  else if (forest) drawForestBackground(horizonY, skyC);
-  else drawCityBackground(horizonY, skyC, night);
+  int revealOffset = 0;
+  if (rSceneTransT < 1.0f) {
+    revealOffset = (int)((1.0f - mixT) * (float)(rSH * 0.32f));
+    if (mixT < 0.45f) drawSceneDecor(rSceneFrom, 0);
+    drawSceneDecor(rSceneIdx, revealOffset);
+  } else {
+    drawSceneDecor(rSceneIdx, 0);
+  }
   drawRoadSurface(edgeC, roadC, dashC);
-  if (desert) drawDesertRoadsideCacti();
-  if (underwater) drawUnderwaterTunnelOverlay();
+  if (rSceneTransT < 1.0f) {
+    drawSceneRoadsideDecor(rSceneIdx, revealOffset);
+  } else {
+    drawSceneRoadsideDecor(rSceneIdx, 0);
+  }
 }
 
 // 在屏幕指定位置画一辆车的正面大图预览(用于选车页)
 // (cx, cy) = 中心，size = 目标高度(像素)
-void drawCarPreview(int type, int cx, int cy, int size) {
+void drawCarPreview(int type, int cx, int cy, int size, bool fast) {
   if (type < 0 || type >= CAR_PREVIEW_TYPES) return;
-  // 用高清预览精灵(120×130)，按目标 size 缩放显示
   int srcW = CAR_PREVIEW_W;
   int srcH = CAR_PREVIEW_H;
   float scale = (float)size / srcH;
@@ -1231,6 +1254,19 @@ void drawCarPreview(int type, int cx, int cy, int size) {
   int dstH = size;
   int x0 = cx - dstW / 2;
   int y0 = cy - dstH / 2;
+  if (fast) {
+    for (int dy = 0; dy < dstH; ++dy) {
+      int sy = (dy * srcH) / dstH;
+      for (int dx = 0; dx < dstW; ++dx) {
+        int sx = (dx * srcW) / dstW;
+        int srcIdx = sy * srcW + sx;
+        if (!pgm_read_byte(&CAR_PREVIEW_MASK[type][srcIdx])) continue;
+        uint16_t c = pgm_read_word(&CAR_PREVIEW_PIXELS[type][srcIdx]);
+        gfxPixel(x0 + dx, y0 + dy, c);
+      }
+    }
+    return;
+  }
   // 双线性插值采样：2×2 邻域加权平均，柔化放大锯齿
   // 浮点采样位置，取 4 个邻居按距离加权
   for (int dy = 0; dy < dstH; ++dy) {
