@@ -76,6 +76,8 @@ static int  carSelectSwipeStartY = -1;    // 滑动起点 y
 #define CAR_SWIPE_THRESHOLD  40           // 滑动判定阈值(像素)
 static float carSelectOffset = 0.0f;     // 车辆图实时 x 偏移(触摸中跟随手指，松开后回弹/过渡)
 static bool  carSelectDragging = false;  // 是否正在拖动(触摸中)
+static float carSelectAnimFrom = 0.0f;   // 动画起点位置
+static float carSelectAnimT = 1.0f;      // 动画进度 0→1(1=完成)
 // 切换过渡动画：从 prevIndex 滑出，carSelectIndex 滑入
 static int   carSelectPrevIndex = 0;     // 切换前的车型(动画中滑出)
 static float carSelectTransT = 1.0f;     // 过渡进度 0→1(1=完成)
@@ -847,8 +849,11 @@ void drawCarSelect() {
   const char* carName = (carSelectIndex >= 0 && carSelectIndex <= 8) ? CAR_NAMES[carSelectIndex] : "?";
   gfxTextCenterBold(carName, cx, cy - previewSize / 2 + 20, 2, rgb565(153, 153, 153), 0xFFFF);
 
-  // 画可见范围内的车(carSelectPos-2 到 +2)，覆盖在车名上方
-  for (int i = -2; i <= 2; ++i) {
+  // 画可见范围内的车：动画中(非整数位置)只画 3 辆省性能，静止时画 5 辆
+  bool isAnimating = (fabsf(pos - roundf(pos)) > 0.01f);
+  int rangeStart = isAnimating ? -1 : -2;
+  int rangeEnd   = isAnimating ?  1 :  2;
+  for (int i = rangeStart; i <= rangeEnd; ++i) {
     int carIdx = (int)roundf(pos) + i;
     if (carIdx < 0 || carIdx > 8) continue;
     float relPos = (float)carIdx - pos;   // 相对中央的距离(负=左，正=右)
@@ -1023,65 +1028,79 @@ void loop() {
   }
 
   if (gameMode == MODE_CAR_SELECT) {
-    // 选车页：滑动切换车辆，点击车/A键 直接进入游戏
+    // 选车页：跟手滑动 + 松手吸附，点击 GO/A 进入游戏
     bool touchActive = (M5.Touch.isEnabled() && M5.Touch.getCount() > 0);
     bool touchJustPressed = touchActive && !carSelectTouchPrev;
     bool touchJustReleased = !touchActive && carSelectTouchPrev;
     carSelectTouchPrev = touchActive;
 
-    // 按下：记录起点，重置切换标记
+    // 按下：记录起点
     if (touchJustPressed) {
       auto& pt = M5.Touch.getTouchPointRaw(0);
       Vec2 tp = touchToScreen(pt.x, pt.y);
       carSelectSwipeStartX = tp.x;
       carSelectSwipeStartY = tp.y;
       carSelectLastX = tp.x;
-      carSelectSwipeUsed = false;   // 新手势，允许切换一次
+      carSelectDragging = true;
+      carSelectSwipeUsed = false;   // 重置：本次手势还没切换
     }
-    // 拖动中：每超过阈值切换一辆，启动过渡动画
-    if (touchActive) {
+
+    // 拖动中：车辆跟手偏移(视觉反馈)，但不切换 index
+    if (touchActive && carSelectDragging) {
       auto& pt = M5.Touch.getTouchPointRaw(0);
       Vec2 tp = touchToScreen(pt.x, pt.y);
       carSelectLastX = tp.x;
-      int dx = tp.x - carSelectSwipeStartX;
-      // 一次手势只切一辆：用 swipeUsed 锁定，必须松开才能切下一辆
-      if (!carSelectSwipeUsed && dx > CAR_SWIPE_THRESHOLD && carSelectIndex > 0) {
-        carSelectPrevIndex = carSelectIndex;
-        carSelectPos = (float)carSelectPrevIndex;   // 动画起点
-        carSelectIndex--;
-        carSelectTransDir = 1; carSelectTransT = 0.0f;
-        carSelectSwipeUsed = true;
-      } else if (!carSelectSwipeUsed && dx < -CAR_SWIPE_THRESHOLD && carSelectIndex < 8) {
-        carSelectPrevIndex = carSelectIndex;
-        carSelectPos = (float)carSelectPrevIndex;   // 动画起点
-        carSelectIndex++;
-        carSelectTransDir = -1; carSelectTransT = 0.0f;
-        carSelectSwipeUsed = true;
-      }
+      // 视觉跟手：车辆位置随手指偏移，但有阻尼(不会滑过一辆)
+      float dx = (float)(tp.x - carSelectSwipeStartX);
+      // 阻尼：偏移量压缩到 ±0.5 车位以内
+      float visOffset = clampf(-dx / (screenW * 0.45f), -0.5f, 0.5f);
+      // 限制边界(第一辆不能往右拖，最后一辆不能往左拖)
+      if (carSelectIndex == 0 && visOffset > 0) visOffset *= 0.3f;
+      if (carSelectIndex == 8 && visOffset < 0) visOffset *= 0.3f;
+      carSelectPos = (float)carSelectIndex + visOffset;
     }
-    // 松开：判断点击 GO 按钮(起点必须有效，即经过了真正的按下)
-    if (touchJustReleased && carSelectSwipeStartX >= 0) {
-      int totalDx = abs(carSelectLastX - carSelectSwipeStartX);
-      if (totalDx < CAR_SWIPE_THRESHOLD) {
-        // 短按：检查是否落在 GO 按钮区域(与绘制尺寸一致)
+
+    // 松开：判断切换 或 点击GO
+    if (touchJustReleased && carSelectDragging) {
+      carSelectDragging = false;
+      int totalDx = carSelectLastX - carSelectSwipeStartX;
+      int absDx = abs(totalDx);
+      if (absDx < 25) {
+        // 短按：检查 GO 按钮
         int goW = 160, goH = 60;
         int goX = screenW / 2 - goW / 2;
-        int goY = screenH / 2 + 10 + 160 / 2 + 30;   // cy + previewSize/2 + 30(上移20)
+        int goY = screenH / 2 + 10 + 160 / 2 + 30;
         if (carSelectSwipeStartX >= goX && carSelectSwipeStartX < goX + goW &&
             carSelectSwipeStartY >= goY && carSelectSwipeStartY < goY + goH) {
-          // 点 GO 按钮 → 进入游戏
           racingSetPlayerCarType(carSelectIndex);
           racingInit();
           gameMode = MODE_RACING;
         }
+      } else {
+        // 滑动：一次只切一辆，启动切换动画
+        carSelectAnimFrom = carSelectPos;   // 动画起点=当前位置
+        carSelectAnimT = 0.0f;              // 重置进度
+        if (totalDx > 0 && carSelectIndex > 0) carSelectIndex--;      // 右滑→上一辆
+        else if (totalDx < 0 && carSelectIndex < 8) carSelectIndex++; // 左滑→下一辆
       }
     }
-    // 推进过渡动画：carSelectPos 从 prevIndex 平滑过渡到 carSelectIndex
-    float targetPos = (float)carSelectIndex;
-    carSelectPos += (targetPos - carSelectPos) * 0.35f;   // 加快滑动速度
-    if (fabsf(targetPos - carSelectPos) < 0.005f) carSelectPos = targetPos;
-    // 同步过渡进度(用于其它逻辑判断，如动画是否完成)
-    carSelectTransT = 1.0f;   // 渲染已改用 carSelectPos，transT 标记为完成
+
+    // 非拖动时：线性插值动画(匀速滑动，比指数衰减更流畅均匀)
+    if (!carSelectDragging) {
+      // carSelectAnimFrom 记录动画起点，carSelectAnimT 从 0→1
+      if (carSelectAnimT < 1.0f) {
+        carSelectAnimT += dt * 6.0f;   // 约 0.17 秒完成
+        if (carSelectAnimT > 1.0f) carSelectAnimT = 1.0f;
+        // ease-out 曲线(开始快结尾缓，比纯线性更自然)
+        float e = 1.0f - (1.0f - carSelectAnimT) * (1.0f - carSelectAnimT);
+        carSelectPos = carSelectAnimFrom + (carSelectIndex - carSelectAnimFrom) * e;
+      } else {
+        carSelectPos = (float)carSelectIndex;
+      }
+    }
+
+    carSelectTransT = 1.0f;
+
     // A 键：直接开始赛车
     if (passPressed) {
       racingSetPlayerCarType(carSelectIndex);
