@@ -264,6 +264,12 @@ extern "C" {
     if (useCanvas) canvas.drawPixel(x, y, c);
     else M5.Display.drawPixel(x, y, c);
   }
+  void gfxPushImageKeyed(int x, int y, int w, int h, const uint16_t* pixels, uint16_t transparent) {
+    const auto* rgbPixels = reinterpret_cast<const lgfx::rgb565_t*>(pixels);
+    lgfx::rgb565_t transparentRgb(transparent);
+    if (useCanvas) canvas.pushImage(x, y, w, h, rgbPixels, transparentRgb);
+    else M5.Display.pushImage(x, y, w, h, rgbPixels, transparentRgb);
+  }
   uint16_t gfxReadPixel(int x, int y) {
     if (useCanvas) return (uint16_t)canvas.readPixel(x, y);
     return (uint16_t)M5.Display.readPixel(x, y);
@@ -1157,7 +1163,8 @@ void loop() {
       racingUpdate(dt);
     }
     racingDraw();
-    delay(16);
+    uint32_t frameElapsed = millis() - now;
+    delay(frameElapsed < 16 ? 16 - frameElapsed : 1);
     return;
   }
 

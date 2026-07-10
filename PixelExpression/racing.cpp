@@ -3,6 +3,7 @@
 #include "racing_enemy_car_sprites.h"
 #include "racing_car_preview.h"   // 选车页高清预览
 #include "racing_coin_sprite.h"
+#include "racing_under_tunnel_sprite.h"
 #include <M5Unified.h>
 #include <math.h>
 #include <pgmspace.h>
@@ -13,6 +14,7 @@ extern "C" {
   void gfxFillScreen(uint16_t c);
   void gfxBox(int x, int y, int w, int h, uint16_t c);
   void gfxPixel(int x, int y, uint16_t c);
+  void gfxPushImageKeyed(int x, int y, int w, int h, const uint16_t* pixels, uint16_t transparent);
   uint16_t gfxReadPixel(int x, int y);
   void gfxRoundBox(int x, int y, int w, int h, int r, uint16_t c);
   void gfxRectLine(int x, int y, int w, int h, uint16_t c);
@@ -160,6 +162,7 @@ static float rObstTimer  = 0.0f;     // 障碍生成计时
 static float rNextCoinDist = 0.0f;   // 下一串金币出现的行驶距离
 static int   rCoinScore  = 0;        // 吃到的金币数
 static int   rNextMeteorScore = 50;  // 每到 50 金币触发一次流星
+static constexpr int SCENE_COIN_INTERVAL = 2;  // 场景测试：正式版本恢复为 20
 static float rHighScore  = 0.0f;     // 最高分(内存)
 static int   rSceneIdx   = 0;        // 0=城市日间 1=黄昏海边 2=海底隧道 3=城市夜间 4=森林 5=沙漠
 static int   rSceneFrom  = 0;        // 场景过渡起点
@@ -178,6 +181,10 @@ static const float COIN_SPAWN_Z = 1.08f;       // 金币先在地平线外生成
 static const float COIN_CHAIN_GAP = 0.075f;    // 一串金币之间的前后间距
 static const float COIN_APPROACH_RATE = 0.24f; // 世界固定金币：玩家接近时才慢慢变大
 
+// 海底隧道首次显示时解码到 PSRAM，之后每帧只做一次透明位图拷贝。
+static uint16_t* sTunnelPixels = nullptr;
+static bool sTunnelDecoded = false;
+
 static int runnerLaneOffset(float lane, int halfW) {
   return (int)(lane * halfW * RUNNER_LANE_SPAN);
 }
@@ -190,16 +197,17 @@ static int roadCenterX(float t, int halfW) {
 
 static void fillQuad(int x0, int y0, int x1, int y1, int x2, int y2, int x3, int y3, uint16_t c);
 static void drawHeadlights(int cx, int baseY, int carW, int carH, float depth, bool player, float lane);
+static void ensureTunnelDecoded();
 
 static void updateSceneState(float dt) {
-  int nextScene = (rCoinScore / 20) % 6;
+  int nextScene = (rCoinScore / SCENE_COIN_INTERVAL) % 6;
   if (nextScene != rSceneIdx) {
     rSceneFrom = rSceneIdx;
     rSceneIdx = nextScene;
     rSceneTransT = 0.0f;
   }
   if (rSceneTransT < 1.0f) {
-    rSceneTransT += dt * 1.2f;
+    rSceneTransT += dt;   // 1秒完成，与赛车入场动画同步
     if (rSceneTransT > 1.0f) rSceneTransT = 1.0f;
   }
 
@@ -263,6 +271,7 @@ void racingSetPlayerCarType(int type) {
 void racingInit() {
   rSW = min(RACING_RENDER_W, (int)M5.Display.width());
   rSH = min(RACING_RENDER_H, (int)M5.Display.height());
+  ensureTunnelDecoded();
   rSpeed = 0.6f;   // 起始即 60km/h
   rStartMs = millis();   // 记录开始时刻，用于分阶段自动提速
   rIntroStartMs = millis();  // 入场动画开始
@@ -290,7 +299,7 @@ void racingInit() {
   rNextMeteorScore = 50;
   rSceneIdx = 0;
   rSceneFrom = 0;
-  rSceneTransT = 1.0f;
+  rSceneTransT = 0.0f;   // 开场也有从下往上升起的动画
   rTimeOfDay = 0.0f;
   rMeteor.active = false;
   rGameOver = false;
@@ -659,7 +668,7 @@ static void racingRestart() {
   rNextMeteorScore = 50;
   rSceneIdx = 0;
   rSceneFrom = 0;
-  rSceneTransT = 1.0f;
+  rSceneTransT = 0.0f;   // 开场也有从下往上升起的动画
   rTimeOfDay = 0.0f;
   rMeteor.active = false;
   rGameOver = false;
@@ -681,11 +690,58 @@ void racingRequestExit() { rExitFlag = true; }
 void racingRestartFromExternal() { racingRestart(); }
 
 // 画一朵云（平滑椭圆组合）
-static void drawCloud(int cx, int cy, int scale) {
-  gfxEllipse(cx, cy, scale * 2, scale, R_CLOUD);
-  gfxEllipse(cx - scale, cy - scale / 3, scale, scale * 2 / 3, R_CLOUD);
-  gfxEllipse(cx + scale, cy - scale / 3, scale, scale * 2 / 3, R_CLOUD);
-  gfxEllipse(cx, cy - scale / 2, scale * 3 / 4, scale * 2 / 3, R_CLOUD);
+static void drawCloud(int cx, int cy, int scale, int variant = 0) {
+  // 4 种不同形态的云，scale 控制大小
+  switch (variant) {
+    case 0:  // 蓬松大云：中间大圆 + 两侧小圆 + 顶部
+      gfxEllipse(cx, cy, scale * 2, scale, R_CLOUD);
+      gfxEllipse(cx - scale, cy - scale / 3, scale, scale * 2 / 3, R_CLOUD);
+      gfxEllipse(cx + scale, cy - scale / 3, scale, scale * 2 / 3, R_CLOUD);
+      gfxEllipse(cx, cy - scale / 2, scale * 3 / 4, scale * 2 / 3, R_CLOUD);
+      break;
+    case 1:  // 长条云：横向延伸多个圆
+      gfxEllipse(cx - scale, cy, scale * 3 / 2, scale * 2 / 3, R_CLOUD);
+      gfxEllipse(cx + scale, cy, scale * 3 / 2, scale * 2 / 3, R_CLOUD);
+      gfxEllipse(cx, cy, scale, scale * 2 / 3, R_CLOUD);
+      gfxEllipse(cx, cy - scale / 3, scale * 2 / 3, scale / 2, R_CLOUD);
+      break;
+    case 2:  // 小团云：紧凑的 2-3 个圆
+      gfxEllipse(cx, cy, scale, scale * 2 / 3, R_CLOUD);
+      gfxEllipse(cx + scale * 2 / 3, cy + scale / 4, scale * 3 / 4, scale / 2, R_CLOUD);
+      gfxEllipse(cx - scale * 2 / 3, cy + scale / 4, scale * 3 / 4, scale / 2, R_CLOUD);
+      break;
+    case 3:  // 高耸云：底部宽顶部尖
+      gfxEllipse(cx, cy, scale * 3 / 2, scale * 2 / 3, R_CLOUD);
+      gfxEllipse(cx, cy - scale / 2, scale, scale * 3 / 4, R_CLOUD);
+      gfxEllipse(cx, cy - scale, scale * 2 / 3, scale / 2, R_CLOUD);
+      gfxEllipse(cx - scale, cy, scale * 3 / 4, scale / 2, R_CLOUD);
+      gfxEllipse(cx + scale, cy, scale * 3 / 4, scale / 2, R_CLOUD);
+      break;
+  }
+}
+
+static void drawDayAirplane(int horizonY) {
+  const uint32_t cycleMs = 14000;
+  const uint32_t flightMs = 8000;
+  uint32_t elapsed = (millis() - rStartMs) % cycleMs;
+  if (elapsed >= flightMs) return;
+
+  float t = (float)elapsed / flightMs;
+  int x = -42 + (int)((rSW + 84) * t);
+  int y = max(42, horizonY / 3) + (int)(sinf(t * 6.2831853f) * 3.0f);
+  uint16_t trailC = RRGB565(220, 230, 232);
+  uint16_t bodyC = RRGB565(246, 248, 244);
+  uint16_t shadeC = RRGB565(176, 194, 204);
+  uint16_t accentC = RRGB565(224, 68, 58);
+
+  gfxLine(x - 42, y + 1, x - 22, y, trailC);
+  gfxLine(x - 38, y + 4, x - 20, y + 2, trailC);
+  gfxWideLine(x - 15, y, x + 15, y - 1, 5, bodyC);
+  gfxEllipse(x + 15, y - 1, 3, 2, bodyC);
+  gfxFillTriangle(x - 3, y, x - 12, y + 11, x + 7, y, shadeC);
+  gfxFillTriangle(x - 1, y - 2, x - 9, y - 10, x + 6, y - 1, bodyC);
+  gfxFillTriangle(x - 13, y, x - 18, y - 7, x - 8, y, accentC);
+  gfxPixel(x + 9, y - 2, RRGB565(54, 104, 144));
 }
 
 // 画一棵树（圆形树冠 + 圆柱树干，平滑风格）
@@ -851,9 +907,9 @@ static void drawForestTree(int x, int baseY, int scale) {
 static void drawForestBackground(int horizonY, uint16_t skyC) {
   int landY = horizonY + 40 + rDecorYOffset;
   if (landY < rSH) gfxBox(0, max(0, landY), rSW, rSH - max(0, landY), RRGB565(54, 132, 68));
-  drawCloud(rSW / 5, horizonY / 3, 9);
-  drawCloud(rSW * 3 / 5, horizonY / 4, 8);
-  drawCloud(rSW * 4 / 5, horizonY / 3, 7);
+  drawCloud(rSW / 5, horizonY / 3, 9, 0);
+  drawCloud(rSW * 3 / 5, horizonY / 4, 8, 1);
+  drawCloud(rSW * 4 / 5, horizonY / 3, 7, 2);
 
   uint16_t farMt = RRGB565(152, 170, 188);
   uint16_t midMt = RRGB565(110, 138, 160);
@@ -888,16 +944,38 @@ static void drawSeagull(int x, int y, int scale, uint16_t c) {
   gfxLine(x + scale, y - scale / 2, x + scale * 2, y, c);
 }
 
-static void drawDuskBackground(int horizonY) {
-  int seaY = horizonY + 14 + rDecorYOffset;
+static void drawDuskBackground(int horizonY, uint16_t skyC) {
+  const int seaSag = 12;
+  int seaFloatY = (int)(sinf(millis() * 0.0009f) * 4.0f);
+  int seaY = horizonY + 4 + seaFloatY + rDecorYOffset;
   int roadTop = roadBodyTopY();
   int seaH = max(0, rSH - seaY);
-  int farSeaH = max(22, roadTop - seaY + 8);
   uint16_t seaTop = RRGB565(30, 130, 238);
   uint16_t seaBot = RRGB565(10, 84, 180);
+  auto seaYAt = [&](int x) {
+    float dx = ((float)x - rSW * 0.5f) / (rSW * 0.5f);
+    return seaY + (int)(seaSag * dx * dx);
+  };
   for (int y = 0; y < seaH; ++y) {
     float t = (float)y / (float)max(1, seaH - 1);
-    gfxBox(0, seaY + y, rSW, 1, rLerpColor(seaTop, seaBot, t));
+    int x0 = 0;
+    int w = rSW;
+    if (y < seaSag) {
+      int halfW = (int)(rSW * 0.5f * sqrtf((float)y / seaSag));
+      x0 = rSW / 2 - halfW;
+      w = max(1, halfW * 2 + 1);
+    }
+    gfxBox(x0, seaY + y, w, 1, rLerpColor(seaTop, seaBot, t));
+  }
+  for (int x = 0; x < rSW; ++x) {
+    float dx = ((float)x - rSW * 0.5f) / (rSW * 0.5f);
+    float edgeYf = seaY + seaSag * dx * dx;
+    int edgeY = (int)floorf(edgeYf);
+    if (edgeY < 0 || edgeY >= rSH) continue;
+    float coverage = 1.0f - (edgeYf - edgeY);
+    uint16_t edgeSeaC = rLerpColor(seaTop, seaBot,
+                                   constrain((float)(edgeY - seaY) / max(1, seaH - 1), 0.0f, 1.0f));
+    gfxPixel(x, edgeY, rLerpColor(skyC, edgeSeaC, coverage));
   }
 
   uint16_t gullC = RRGB565(255, 236, 170);
@@ -907,17 +985,25 @@ static void drawDuskBackground(int horizonY) {
 
   uint16_t glint = RRGB565(255, 220, 128);
   for (int i = 0; i < 9; ++i) {
-    int y = seaY + 6 + i * 4;
     int x = (i * 53 + 22) % rSW;
     int w = 18 + (i % 4) * 9;
+    int y = seaYAt(x + w / 2) + 6 + i * 4;
     gfxBox(x, y, w, 1, rLerpColor(seaTop, glint, 0.45f));
   }
 
   uint16_t hull = RRGB565(62, 72, 96);
   uint16_t sail = RRGB565(238, 222, 178);
-  drawSmallBoat(rSW / 5, seaY + farSeaH / 2 + 2, 5, hull, sail);
-  drawSmallBoat(rSW * 3 / 5, seaY + farSeaH / 2 - 4, 4, RRGB565(76, 64, 88), RRGB565(226, 208, 170));
-  drawSmallBoat(rSW * 4 / 5, seaY + farSeaH / 2 + 7, 3, RRGB565(70, 78, 92), RRGB565(218, 202, 166));
+  int boatX1 = rSW / 5;
+  int boatX2 = rSW * 3 / 5;
+  int boatX3 = rSW * 4 / 5;
+  int boatSeaY1 = seaYAt(boatX1);
+  int boatSeaY2 = seaYAt(boatX2);
+  int boatSeaY3 = seaYAt(boatX3);
+  drawSmallBoat(boatX1, boatSeaY1 + max(22, roadTop - boatSeaY1 + 8) / 2 + 2, 5, hull, sail);
+  drawSmallBoat(boatX2, boatSeaY2 + max(22, roadTop - boatSeaY2 + 8) / 2 - 4, 4,
+                RRGB565(76, 64, 88), RRGB565(226, 208, 170));
+  drawSmallBoat(boatX3, boatSeaY3 + max(22, roadTop - boatSeaY3 + 8) / 2 + 7, 3,
+                RRGB565(70, 78, 92), RRGB565(218, 202, 166));
 }
 
 static void drawCactus(int x, int baseY, int scale, uint16_t c) {
@@ -959,9 +1045,8 @@ static void drawDesertBackground(int horizonY) {
     gfxBox(x, y, 34 + (i % 3) * 10, 1, haze);
   }
 
-}
-
-static void drawDesertRoadsideCacti() {
+  // 仙人掌画在背景层（赛道之前），会被赛道遮挡边缘
+  // 赛车左右移动时，赛道边缘移动，露出更多仙人掌
   struct RoadsideCactus {
     float t;
     int side;
@@ -998,18 +1083,147 @@ static void drawFishShadow(int x, int y, int scale, uint16_t c, bool flip) {
   gfxPixel(x + tail * scale, y - scale / 3, RRGB565(145, 215, 215));
 }
 
-static void drawUnderwaterBackground(int horizonY) {
-  uint16_t waterTop = RRGB565(26, 150, 160);
-  uint16_t waterBot = RRGB565(8, 68, 104);
-  for (int y = 0; y < rSH; ++y) {
-    float t = (float)y / (float)max(1, rSH - 1);
-    gfxBox(0, y, rSW, 1, rLerpColor(waterTop, waterBot, t));
+static void drawFishSilhouette(int x, int y, int scale, uint16_t c, bool flip, int variant) {
+  if (scale < 3) return;
+  int dir = flip ? -1 : 1;
+  if (variant == 1) {
+    gfxEllipse(x, y, scale * 3, max(2, scale / 2), c);
+    gfxFillTriangle(x - dir * scale * 3, y,
+                    x - dir * scale * 4, y - scale,
+                    x - dir * scale * 4, y + scale, c);
+    gfxFillTriangle(x + dir * scale / 2, y - scale / 2,
+                    x + dir * scale * 2, y - scale * 2,
+                    x + dir * scale * 2, y, c);
+  } else if (variant == 2) {
+    gfxFillTriangle(x + dir * scale * 2, y,
+                    x - dir * scale, y - scale * 2,
+                    x - dir * scale, y + scale * 2, c);
+    gfxFillTriangle(x - dir * scale, y,
+                    x - dir * scale * 3, y - scale,
+                    x - dir * scale * 3, y + scale, c);
+  } else {
+    drawFishShadow(x, y, scale, c, flip);
   }
+}
 
-  uint16_t rayC = RRGB565(84, 196, 188);
+static void drawSharkSilhouette(int x, int y, int scale, uint16_t c, bool flip) {
+  if (scale < 5) return;
+  int dir = flip ? -1 : 1;
+  gfxEllipse(x, y, scale * 4, max(2, scale), c);
+  gfxFillTriangle(x - dir * scale * 4, y,
+                  x - dir * scale * 6, y - scale * 2,
+                  x - dir * scale * 6, y + scale * 2, c);
+  gfxFillTriangle(x - dir * scale, y - scale,
+                  x + dir * scale, y - scale * 4,
+                  x + dir * scale * 2, y - scale / 2, c);
+  gfxFillTriangle(x - dir * scale / 2, y + scale,
+                  x + dir * scale, y + scale * 3,
+                  x + dir * scale * 2, y + scale / 2, c);
+  gfxFillTriangle(x + dir * scale * 3, y,
+                  x + dir * scale * 5, y - scale,
+                  x + dir * scale * 5, y + scale, c);
+}
+
+static int wrapFishX(uint32_t nowMs, int baseX, int travel, float speed, bool flip) {
+  int span = rSW + travel * 2;
+  int phase = (int)(nowMs * speed) % max(1, span);
+  int x = flip ? (rSW + travel - phase) : (-travel + phase);
+  return x + baseX;
+}
+
+static void drawSeaweedClump(int baseX, int baseY, int height, int side, uint16_t c) {
+  int stems = 5 + (height / 24);
+  for (int i = 0; i < stems; ++i) {
+    int h = max(30, height - ((i * 17) % max(34, height / 2)));
+    int x0 = baseX + side * (i * 6 + (i % 3) * 3);
+    int y0 = baseY + ((i * 5) % 17);
+    int lean = side * (10 + (i % 4) * 5);
+    int w = (i % 3 == 0) ? 4 : 3;
+    gfxWideLine(x0, y0, x0 + lean, y0 - h, w, c);
+    for (int k = 1; k <= 4; ++k) {
+      int y = baseY - h * k / 4;
+      int x = x0 + lean * k / 4;
+      int leaf = 9 + ((i + k) % 4) * 4;
+      gfxLine(x, y, x - side * leaf, y - leaf / 2, c);
+      gfxLine(x, y - 2, x + side * (leaf - 2), y - leaf, c);
+      if ((i + k) % 3 == 0) {
+        gfxLine(x, y + 2, x - side * (leaf - 3), y + leaf / 3, c);
+      }
+    }
+  }
+}
+
+// 首次进入海底场景时，把 2-bit 压缩数据预解码为 RGB565 透明位图。
+static void ensureTunnelDecoded() {
+  if (sTunnelDecoded) return;
+  uint16_t darkC = RRGB565(0, 15, 26);
+  uint16_t brightC = RRGB565(96, 186, 255);
+  size_t pixelCount = (size_t)UNDER_TUNNEL_SPRITE_W * UNDER_TUNNEL_SPRITE_H;
+  sTunnelPixels = (uint16_t*)ps_malloc(pixelCount * sizeof(uint16_t));
+  if (!sTunnelPixels) return;
+
+  for (int y = 0; y < UNDER_TUNNEL_SPRITE_H; ++y) {
+    int row = y * UNDER_TUNNEL_SPRITE_STRIDE;
+    for (int x = 0; x < UNDER_TUNNEL_SPRITE_W; ++x) {
+      uint8_t b = pgm_read_byte(&UNDER_TUNNEL_SPRITE_PIXELS[row + (x >> 2)]);
+      uint8_t level = (b >> (6 - ((x & 3) << 1))) & 0x03;
+      sTunnelPixels[(size_t)y * UNDER_TUNNEL_SPRITE_W + x] =
+          level == 2 ? brightC : (level == 1 ? darkC : 0);
+    }
+  }
+  sTunnelDecoded = true;
+}
+
+static void drawUnderwaterTunnelImage() {
+  ensureTunnelDecoded();
+  if (!sTunnelDecoded) return;
+  int roadTopCx = rSW / 2 - (int)(rCamX * 0.25f) +
+                  (int)(rCurve * CURVE_STRENGTH * (rSW * 0.5f)) -
+                  (int)(rCarX * 39.0f);
+  int x0 = roadTopCx - UNDER_TUNNEL_SPRITE_W / 2;
+  int y0 = roadBodyTopY() - UNDER_TUNNEL_SPRITE_H + 64 + rDecorYOffset;
+
+  gfxPushImageKeyed(x0, y0, UNDER_TUNNEL_SPRITE_W, UNDER_TUNNEL_SPRITE_H,
+                    sTunnelPixels, 0);
+}
+
+static void drawUnderwaterBackground(int horizonY) {
+  uint16_t waterTop = RRGB565(0x0D, 0x6D, 0xDA);
+  gfxBox(0, 0, rSW, rSH, waterTop);
+
+  // 背景元素（光柱、气泡、海草、鱼）不参与上升动画，固定在最终位置
+  int tunnelOffset = rDecorYOffset;
+  rDecorYOffset = 0;
+
+  uint16_t rayC = RRGB565(42, 146, 220);
+  int rayTopY = rDecorYOffset - 40;
+  int rayEndY = horizonY + 132 + rDecorYOffset - 40;
+  int apexX = rSW / 2;
+  const int rayCenters[5] = { -178, -88, 0, 88, 178 };
+  const int rayHalfWidths[5] = { 18, 24, 30, 24, 18 };
   for (int i = 0; i < 5; ++i) {
-    int x = 26 + i * 88;
-    gfxFillTriangle(x, rDecorYOffset, x + 30, rDecorYOffset, x - 38, horizonY + 118 + rDecorYOffset, rayC);
+    int bottomX = apexX + rayCenters[i];
+    int topHalf = (i == 2) ? 8 : 5;
+    int topLeft = apexX - topHalf;
+    int topRight = apexX + topHalf;
+    int bottomLeft = bottomX - rayHalfWidths[i];
+    int bottomRight = bottomX + rayHalfWidths[i];
+    int visibleTopY = max(0, rayTopY);
+    const int gradientSteps = 48;
+    for (int step = 0; step < gradientSteps; ++step) {
+      int y0 = visibleTopY + (rayEndY - visibleTopY) * step / gradientSteps;
+      int y1 = visibleTopY + (rayEndY - visibleTopY) * (step + 1) / gradientSteps;
+      float geomT0 = (float)(y0 - rayTopY) / max(1, rayEndY - rayTopY);
+      float geomT1 = (float)(y1 - rayTopY) / max(1, rayEndY - rayTopY);
+      int left0 = topLeft + (int)((bottomLeft - topLeft) * geomT0);
+      int right0 = topRight + (int)((bottomRight - topRight) * geomT0);
+      int left1 = topLeft + (int)((bottomLeft - topLeft) * geomT1);
+      int right1 = topRight + (int)((bottomRight - topRight) * geomT1);
+      float fadeT = (float)step / (gradientSteps - 1);
+      fadeT = fadeT * fadeT * (3.0f - 2.0f * fadeT);
+      uint16_t bandC = rLerpColor(rayC, waterTop, fadeT);
+      fillQuad(left0, y0, right0, y0, right1, y1, left1, y1, bandC);
+    }
   }
 
   uint16_t bubble = RRGB565(150, 230, 225);
@@ -1021,34 +1235,55 @@ static void drawUnderwaterBackground(int horizonY) {
     if (r > 2) gfxPixel(x + r - 1, y - r + 1, RRGB565(205, 255, 250));
   }
 
-  drawFishShadow(rSW / 5, horizonY + 18 + rDecorYOffset, 6, RRGB565(22, 88, 112), false);
-  drawFishShadow(rSW * 3 / 5, horizonY - 8 + rDecorYOffset, 5, RRGB565(18, 78, 100), true);
-  drawFishShadow(rSW * 4 / 5, horizonY + 54 + rDecorYOffset, 4, RRGB565(25, 96, 118), false);
-}
-
-static void drawUnderwaterTunnelOverlay() {
-  uint16_t ringC = RRGB565(128, 236, 228);
-  uint16_t dimC = RRGB565(46, 138, 152);
-  for (int i = 0; i < 5; ++i) {
-    float t = 0.18f + i * 0.16f;
-    int y, halfW;
-    roadGeom(t, y, halfW);
-    y += rDecorYOffset;
-    int cx = roadCenterX(t, halfW);
-    int ringH = max(8, (int)(halfW * 0.20f));
-    int left = max(0, cx - halfW);
-    int right = min(rSW - 1, cx + halfW);
-    uint16_t c = (i & 1) ? dimC : ringC;
-    gfxLine(left, y, cx - halfW / 3, y - ringH, c);
-    gfxLine(cx - halfW / 3, y - ringH, cx + halfW / 3, y - ringH, c);
-    gfxLine(cx + halfW / 3, y - ringH, right, y, c);
+  uint16_t fishDark = RRGB565(12, 70, 132);
+  uint16_t fishMid = RRGB565(15, 86, 150);
+  uint16_t fishDeep = RRGB565(6, 50, 110);
+  struct SwimFish {
+    int baseX;
+    int y;
+    int scale;
+    bool flip;
+    int variant;
+    float speed;
+  };
+  const SwimFish fish[] = {
+    {-120, horizonY - 50, 4, false, 0, 0.010f},
+    {  40, horizonY - 34, 5, false, 1, 0.013f},
+    { 180, horizonY - 18, 3, false, 2, 0.017f},
+    { -30, horizonY + 14, 7, true,  1, 0.008f},
+    { 120, horizonY + 42, 3, true,  0, 0.015f},
+    { 260, horizonY - 42, 4, true,  2, 0.012f},
+    {-240, horizonY + 58, 4, false, 2, 0.011f},
+    { 320, horizonY - 4, 6, true,  0, 0.009f},
+    {-360, horizonY + 30, 3, false, 1, 0.018f},
+  };
+  uint32_t nowMs = millis();
+  for (int i = 0; i < (int)(sizeof(fish) / sizeof(fish[0])); ++i) {
+    int x = wrapFishX(nowMs, fish[i].baseX, 70, fish[i].speed, fish[i].flip);
+    int y = fish[i].y + rDecorYOffset + (int)(sinf(nowMs * 0.00045f + i * 0.9f) * 4.0f);
+    uint16_t c = (i % 3 == 0) ? fishDeep : ((i % 2 == 0) ? fishMid : fishDark);
+    drawFishSilhouette(x, y, fish[i].scale, c, fish[i].flip, fish[i].variant);
   }
+  int sharkX = wrapFishX(nowMs, -220, 130, 0.006f, false);
+  int sharkY = horizonY + 72 + rDecorYOffset + (int)(sinf(nowMs * 0.00028f) * 5.0f);
+  drawSharkSilhouette(sharkX, sharkY, 7, fishDeep, false);
+  int sharkX2 = wrapFishX(nowMs, 260, 120, 0.0045f, true);
+  int sharkY2 = horizonY - 58 + rDecorYOffset + (int)(sinf(nowMs * 0.00024f + 1.7f) * 4.0f);
+  drawSharkSilhouette(sharkX2, sharkY2, 5, fishDark, true);
+  // 仅隧道轮廓保留上升动画
+  rDecorYOffset = tunnelOffset;
+  drawUnderwaterTunnelImage();
+  rDecorYOffset = 0;
 }
 
 static void drawCityBackground(int horizonY, uint16_t skyC, float night) {
   if (night < 0.55f) {
-    drawCloud(rSW / 4, horizonY / 3, 10);
-    drawCloud(rSW * 2 / 3, horizonY / 4, 8);
+    // 4 朵不同形态、不同大小的云
+    drawCloud(rSW / 6,     horizonY / 3,     13, 0);  // 大蓬松云(左)
+    drawCloud(rSW * 2 / 5, horizonY / 5,     7,  2);  // 小团云(中上)
+    drawCloud(rSW * 3 / 5, horizonY / 3 + 10, 11, 3); // 高耸云(右中)
+    drawCloud(rSW * 5 / 6, horizonY / 4,     9,  1);  // 长条云(右)
+    if (rSceneIdx == 0 || rSceneFrom == 0) drawDayAirplane(horizonY);
   } else {
     const int starCount = 30;
     int starMaxY = max(24, roadBodyTopY() - 8);
@@ -1072,7 +1307,7 @@ static void drawCityBackground(int horizonY, uint16_t skyC, float night) {
   }
 
   const int SAG2 = rSH / 7;
-  const int SKY_OFFSET = 60;
+  const int SKY_OFFSET = 50;
   for (int i = 0; i < 12; ++i) {
     int bw = 22 + (i % 4) * 7;
     int bh = 28 + ((i * 11) % 38);
@@ -1082,7 +1317,7 @@ static void drawCityBackground(int horizonY, uint16_t skyC, float night) {
     uint16_t dayB = buildingColor(i, -8);
     uint16_t nightB = RRGB565(24 + (i % 3) * 5, 18 + (i % 4) * 4, 48 + (i % 2) * 8);
     uint16_t b = rLerpColor(dayB, nightB, night);
-    gfxBox(bx, baseHY - bh, bw, bh + extraDown, b);
+    gfxBox(bx, baseHY - bh, bw, bh + extraDown + 20, b);
     uint16_t win = rLerpColor(RRGB565(210, 236, 248), RRGB565(245, 230, 116), night);
     if ((i % 2) == 0 || night > 0.5f) gfxBox(bx + bw / 2, baseHY - bh / 2, 3, 4, win);
   }
@@ -1121,15 +1356,18 @@ static void drawRoadSurface(uint16_t edgeC, uint16_t roadC, uint16_t dashC) {
   static const float dashLanes[2] = { -0.5f, 0.5f };
   const float dashSegLen = 0.11f;
   const float dashSpacing = 0.24f;
-  const int dashCount = 3;
+  const int dashCount = 5;
+  const float dashSpawnT = 1.08f;
   float dashPhase = fmodf(rSroll * 0.05f, dashSpacing);
   for (int d = 0; d < 2; ++d) {
     for (int seg = 0; seg < dashCount; ++seg) {
-      float dashStart = 0.84f - (seg * dashSpacing) - dashPhase;
+      float dashStart = dashSpawnT - (seg * dashSpacing) - dashPhase;
       float dashEnd = dashStart + dashSegLen;
-      if (dashStart <= 0.03f) continue;
+      if (dashEnd <= 0.03f || dashStart >= 0.995f) continue;
+      dashStart = max(0.03f, dashStart);
       dashEnd = min(0.995f, dashEnd);
-      const int pieces = 8;
+      if (dashEnd <= dashStart) continue;
+      const int pieces = 10;
       int prevX = -1, prevY = -1, prevHalfW = 0;
       float prevWrap = 0;
       for (int i = 0; i <= pieces; ++i) {
@@ -1138,13 +1376,17 @@ static void drawRoadSurface(uint16_t edgeC, uint16_t roadC, uint16_t dashC) {
         roadGeom(t, yg, hwg);
         float wrap = constrain((t - 0.55f) / 0.45f, 0.0f, 1.0f);
         float roll = wrap * wrap * (3.0f - 2.0f * wrap);
-        float lanePos = dashLanes[d] * (1.0f - 0.62f * roll);
-        int cx = roadCenterX(t, hwg) + runnerLaneOffset(lanePos, hwg);
-        int cy = yg - (int)(sinf(roll * 3.1415926f) * 26.0f) - (int)(roll * 8.0f);
+        int cx = roadCenterX(t, hwg) + runnerLaneOffset(dashLanes[d], hwg);
+        float emerge = constrain((0.995f - t) / 0.055f, 0.0f, 1.0f);
+        emerge = emerge * emerge * (3.0f - 2.0f * emerge);
+        int cy = yg;
         float wrapMid = (i > 0) ? (wrap + prevWrap) * 0.5f : wrap;
         int shade = (int)(210 - 140 * wrapMid);
-        uint16_t coreC = rLerpColor(RRGB565(70, 70, 76), dashC, constrain((float)shade / 210.0f, 0.0f, 1.0f));
-        int lineW = max(2, (int)(hwg * (0.028f - 0.020f * wrapMid)));
+        uint16_t visibleC = rLerpColor(RRGB565(70, 70, 76), dashC,
+                                       constrain((float)shade / 210.0f, 0.0f, 1.0f));
+        uint16_t coreC = rLerpColor(roadC, visibleC, emerge);
+        // 线宽不参与渐隐：新虚线由椭圆顶端的长度裁切露出，像从路面背后翻出来。
+        int lineW = max(6, (int)(hwg * (0.030f - 0.018f * wrapMid)));
         int halfW = lineW / 2;
 
         if (i > 0) {
@@ -1177,7 +1419,7 @@ static void drawSkyAndRoad() {
   };
   auto sceneRoad = [&](int scene) -> uint16_t {
     if (scene == 1) return RRGB565(0xD3, 0x44, 0xE3);
-    if (scene == 2) return RRGB565(42, 122, 138);
+    if (scene == 2) return RRGB565(0x29, 0x44, 0x58);
     if (scene == 4) return RRGB565(30, 50, 95);
     if (scene == 5) return RRGB565(178, 150, 104);
     return rLerpColor(RRGB565(54, 58, 64), RRGB565(18, 15, 44), sceneNight(scene));
@@ -1212,34 +1454,35 @@ static void drawSkyAndRoad() {
   };
   auto drawSceneDecor = [&](int scene, int yOffset) {
     rDecorYOffset = yOffset;
-    if (scene == 1) drawDuskBackground(horizonY);
+    if (scene == 1) drawDuskBackground(horizonY, skyC);
     else if (scene == 5) drawDesertBackground(horizonY);
     else if (scene == 2) drawUnderwaterBackground(horizonY);
     else if (scene == 4) drawForestBackground(horizonY, skyC);
     else drawCityBackground(horizonY, skyC, sceneDecorNight(scene));
     rDecorYOffset = 0;
   };
-  auto drawSceneRoadsideDecor = [&](int scene, int yOffset) {
-    rDecorYOffset = yOffset;
-    if (scene == 5) drawDesertRoadsideCacti();
-    if (scene == 2) drawUnderwaterTunnelOverlay();
-    rDecorYOffset = 0;
-  };
-
   gfxBox(0, 0, rSW, rSH, skyC);
+  uint32_t tBg = 0, tRoad = 0, tDecor = 0;
+  uint32_t t0 = micros();
   int revealOffset = 0;
   if (rSceneTransT < 1.0f) {
     revealOffset = (int)((1.0f - mixT) * (float)(rSH * 0.32f));
-    if (mixT < 0.45f) drawSceneDecor(rSceneFrom, 0);
+    // 场景不同时才画旧场景底图；相同时(如开场)只画新场景升起动画
+    if (rSceneFrom != rSceneIdx && mixT < 0.45f) drawSceneDecor(rSceneFrom, 0);
     drawSceneDecor(rSceneIdx, revealOffset);
   } else {
     drawSceneDecor(rSceneIdx, 0);
   }
+  tBg = micros() - t0;
+  t0 = micros();
   drawRoadSurface(edgeC, roadC, dashC);
-  if (rSceneTransT < 1.0f) {
-    drawSceneRoadsideDecor(rSceneIdx, revealOffset);
-  } else {
-    drawSceneRoadsideDecor(rSceneIdx, 0);
+  tRoad = micros() - t0;
+  tDecor = 0;
+  // 海底场景每 30 帧输出一次各阶段耗时
+  static uint32_t profFrame = 0;
+  if (rSceneIdx == 2 && (++profFrame % 30) == 0) {
+    Serial.printf("[PROF] bg=%lu us  road=%lu us  roadside=%lu us\n",
+                  (unsigned long)tBg, (unsigned long)tRoad, (unsigned long)tDecor);
   }
 }
 
@@ -1459,7 +1702,7 @@ static void drawSoftLightFan(int cx0, int y0, int half0, int cx1, int y1, int ha
 }
 
 static void drawHeadlights(int cx, int baseY, int carW, int carH, float depth, bool player, float lane) {
-  if (rSceneIdx != 3) return;
+  if (rSceneIdx != 2 && rSceneIdx != 3) return;
   int roadTop = roadBodyTopY();
   if (baseY <= roadTop + 18) return;
 
@@ -1652,13 +1895,33 @@ static void drawPlayerCar() {
 
 // ---- 绘制：HUD（顶部分数条 + 底部速度仪表）----
 static void drawHUD() {
-  // 整个 HUD 开场完全不可见，2s 后从 0% 到 100% 淡入。
   if (!rHudFadeActive) return;
   uint32_t fadeElapsed = millis() - rHudFadeStartMs;
   float hudAlpha = constrain((float)fadeElapsed / 1000.0f, 0.0f, 1.0f);
   if (hudAlpha <= 0.01f) return;
-  // 纯淡入：不混紫色，0 时完全不可见，随后从暗到原色。
+  // 真正的透明度渐显：把 HUD 颜色和屏幕背景做 alpha 混合
+  // hudAlpha=0 → 与背景同色(完全不可见), hudAlpha=1 → 原色(完全显示)
+  // 在渐显阶段，所有像素绘制改为"读背景→混合→写入"
+  bool fading = hudAlpha < 0.995f;
+  auto blendPixel = [&](int x, int y, uint16_t c) {
+    if (!fading) { gfxPixel(x, y, c); return; }
+    uint16_t bg = gfxReadPixel(x, y);
+    int br = (bg >> 11) & 0x1F, bg5 = (bg >> 5) & 0x3F, bb = bg & 0x1F;
+    int cr = (c >> 11) & 0x1F, cg5 = (c >> 5) & 0x3F, cb = c & 0x1F;
+    int r = br + (int)((cr - br) * hudAlpha);
+    int g = bg5 + (int)((cg5 - bg5) * hudAlpha);
+    int b = bb + (int)((cb - bb) * hudAlpha);
+    gfxPixel(x, y, (uint16_t)((r << 11) | (g << 5) | b));
+  };
+  auto blendBox = [&](int x, int y, int w, int h, uint16_t c) {
+    if (!fading) { gfxBox(x, y, w, h, c); return; }
+    for (int dy = 0; dy < h; ++dy)
+      for (int dx = 0; dx < w; ++dx)
+        blendPixel(x + dx, y + dy, c);
+  };
+  // 文字用 fadeColor（和黑色混合）近似渐显，深色背景上视觉效果接近 alpha 混合
   auto fadeColor = [&](uint16_t c) {
+    if (!fading) return c;
     int r = (c >> 11) & 0x1F, g = (c >> 5) & 0x3F, b = c & 0x1F;
     r = (int)(r * hudAlpha);
     g = (int)(g * hudAlpha);
@@ -1676,11 +1939,10 @@ static void drawHUD() {
   int scoreX = centerX - 80;   // 中心偏左：SCORE
   int bestX = centerX + 80;    // 中心偏右：BEST
   snprintf(buf, sizeof(buf), "%d", rCoinScore);
-  // 全部用 Font4(原生最大矢量字体)，无像素感
-  gfxTextCenterS("SCORE", scoreX, 68, 2, cDim, 0xFFFF);      // 标签 Font0×2 (~16px)
-  gfxTextCenterF4(buf, scoreX, 104, 1, cWhite, 0xFFFF);      // 数字 Font4(同仪表盘)
+  gfxTextCenterS("SCORE", scoreX, 68, 2, cDim, 0xFFFF);
+  gfxTextCenterF4(buf, scoreX, 104, 1, cWhite, 0xFFFF);
   snprintf(buf, sizeof(buf), "%d", (int)rHighScore);
-  gfxTextCenterS("BEST", bestX, 68, 2, cDim, 0xFFFF);       // 标签 Font0×2 (~16px)
+  gfxTextCenterS("BEST", bestX, 68, 2, cDim, 0xFFFF);
   gfxTextCenterF4(buf, bestX, 104, 1, cYellow, 0xFFFF);
 
   int carBottom = rSH - 16 - 40 - 20;
@@ -1692,19 +1954,29 @@ static void drawHUD() {
     float rad = a * (3.14159265f / 180.0f);
     int px = gx + (int)(cosf(rad) * gr);
     int py = gy - (int)(sinf(rad) * gr);
-    gfxBox(px - 1, py - 1, 2, 2, cWhite);
+    blendBox(px - 1, py - 1, 2, 2, cWhite);
   }
   // 指针(红色)
   float realRatio = constrain(rSpeed / 3.0f, 0.0f, 1.0f);
   float needleAngle = (180.0f - realRatio * 180.0f) * (3.14159265f / 180.0f);
   int nx = gx + (int)(cosf(needleAngle) * (gr - 6));
   int ny = gy - (int)(sinf(needleAngle) * (gr - 6));
-  gfxWideLine(gx, gy, nx, ny, 2, cRed);
-  gfxCircle(gx, gy, 3, cRed);
+  // 渐显阶段用逐像素混合画线
+  if (fading) {
+    int steps = max(abs(nx - gx), abs(ny - gy)) + 1;
+    for (int i = 0; i <= steps; ++i) {
+      int px = gx + (nx - gx) * i / steps;
+      int py = gy + (ny - gy) * i / steps;
+      blendBox(px - 1, py - 1, 3, 3, cRed);
+    }
+    blendBox(gx - 3, gy - 3, 6, 6, cRed);
+  } else {
+    gfxWideLine(gx, gy, nx, ny, 2, cRed);
+    gfxCircle(gx, gy, 3, cRed);
+  }
   // 速度数字
   int kmh = (int)(rSpeed * 100.0f);
   snprintf(buf, sizeof(buf), "%d", kmh);
-  // 数字放在半圆内，Font4(大号加粗)，透明背景
   gfxTextCenter(buf, gx, gy - 2, 4, cWhite, 0xFFFF);
   gfxTextCenter("km/h", gx, gy + 24, 0, cDim, 0xFFFF);
 
@@ -1739,11 +2011,24 @@ static void drawGameOver() {
 void racingDraw() {
   // 玩家向左时半圆向右，玩家向右时半圆向左，制造镜头反向跟随感。
   rCamX = rCarX * 52.0f;
+  uint32_t tA = micros();
   drawSkyAndRoad();
+  uint32_t tB = micros();
   drawObstaclesSorted();
+  uint32_t tC = micros();
   drawPlayerCar();
+  uint32_t tD = micros();
   drawCoinPops();
   drawHUD();
+  uint32_t tE = micros();
   if (rGameOver) drawGameOver();
   gfxPushFrame();
+  uint32_t tF = micros();
+  static uint32_t profFrame2 = 0;
+  if ((++profFrame2 % 30) == 0) {
+    Serial.printf("[FRAME sc=%d] skyRoad=%lu  obs=%lu  player=%lu  coinsHud=%lu  push=%lu  total=%lu us\n",
+                  rSceneIdx,
+                  (unsigned long)(tB-tA), (unsigned long)(tC-tB), (unsigned long)(tD-tC),
+                  (unsigned long)(tE-tD), (unsigned long)(tF-tE), (unsigned long)(tF-tA));
+  }
 }
