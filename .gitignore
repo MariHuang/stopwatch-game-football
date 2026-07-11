@@ -4,6 +4,7 @@ build/
 .vscode/
 *.tmp
 *.log
+.zcode/
 
 # Local generated previews
 basket_hoop_cutout.png
@@ -14,3 +15,4 @@ car_sprites_preview.png
 car_sprites_preview_checker.png
 car_sprites_preview_on_road.png
 racing_enemy_cars_preview.png
+underwater_tunnel_preview.png

@@ -3,6 +3,9 @@
 #include <math.h>
 #include "racing.h"
 #include "basket_hoop_sprite.h"
+#include "shot_sound.h"
+#include "miss_sound.h"
+#include "bgm_select.h"   // 选车场景背景音乐
 
 static constexpr uint8_t KEY_A_PIN = 2;  // StopWatch KEYA (yellow)
 static constexpr uint8_t KEY_B_PIN = 1;  // StopWatch KEYB (blue)
@@ -44,15 +47,6 @@ struct Vec2 {
   float y;
 };
 
-struct Player {
-  Vec2 pos;
-  Vec2 vel;
-  uint8_t number;
-  bool home;
-  uint8_t hairStyle;   // 0=短发 1=寸头 2=中分 3=蓬松 4=马尾 5=光头(少数)
-  uint16_t hairColor;
-};
-
 struct RawButton {
   uint8_t pin;
   bool idleLevel;
@@ -62,6 +56,8 @@ struct RawButton {
 };
 
 static M5Canvas canvas(&M5.Display);
+static M5Canvas hudTextMask(&M5.Display);
+static bool hudTextMaskReady = false;
 static bool useCanvas = false;
 static constexpr int RENDER_W = 466;
 static constexpr int RENDER_H = 466;
@@ -71,120 +67,44 @@ static int screenOffsetX = 0;
 static int screenOffsetY = 0;
 
 // ---- 游戏模式 ----
-enum GameMode { MODE_MENU, MODE_FOOTBALL, MODE_RACING, MODE_BASKETBALL };
+enum GameMode { MODE_MENU, MODE_RACING, MODE_BASKETBALL, MODE_CAR_SELECT };
 static GameMode gameMode = MODE_MENU;
-static constexpr int GAME_COUNT = 3;
-static int menuSelected = 0;        // 菜单当前选中项 0=足球 1=赛车 2=空气投篮
-
-static int fieldLeft = 20;
-static int fieldRight = 448;
-static int fieldTop = 48;
-static int fieldBottom = 458;
-static int goalLeft = 176;
-static int goalRight = 292;
-static float cameraX = 0.0f;
-static float cameraY = 0.0f;
-static constexpr int GOAL_VIEW_PAD = 82;
-static constexpr int SIDE_VIEW_PAD = 76;
-static constexpr int GOAL_DEPTH = 40;
-static constexpr int PITCH_LINE_W = 3;
-static constexpr int FIELD_SCALE_NUM = 178;
-static constexpr int FIELD_SCALE_DEN = 100;
-static constexpr int HOME_COUNT = 4;
-static constexpr int AWAY_COUNT = 4;
-static constexpr int HOME_KEEPER_CONTROL = HOME_COUNT;
-
-static Player home[HOME_COUNT];
-static Player away[AWAY_COUNT];
-static Player keeper;
-static Player homeKeeper;
-static Vec2 ballPos;
-static Vec2 ballVel;
-static Vec2 moveInput = {0.0f, 0.0f};
-static Vec2 lastAim = {0.0f, -1.0f};
-
-static int ballOwner = 0;     // 0..3 home, 10..13 away, 20 away keeper, 21 home keeper, -1 loose
-static int controlled = 0;
-static int passTarget = -1;
-static bool lastTouchHome = true;
-static int playerScore = 0;
-static int cpuScore = 0;
-
-// ---- 比赛时间系统 ----
-// 真实时间：上半场 180s + 补时 30~50s + 下半场 180s + 补时 30~50s
-// 显示时间 = 真实时间(每秒 +1)：上半场 0:00~3:00，下半场 3:00~6:00，补时按真实秒
-
-// 中圈开球状态：开球时需两名同队球员在中圈，一人传球给另一人才算开球
-static bool kickoffPending = false;   // 是否处于"等待开球传球"状态
-static int kickoffPasser = -1;        // 开球持球者索引(0..3 或 10..13)
-static int kickoffReceiver = -1;      // 开球接球者索引
-
-// 定位球准备状态(统一处理界外球/角球/球门球)：球出界后定格2s，球员再跑去发球点
-// setPieceState: 0=无, 1=定格等待中, 2=球员已就位发球
-// setPieceType:  0=界外球, 1=角球/球门球
-static int setPieceState = 0;
-static uint32_t setPieceUntil = 0;
-static int setPieceType = 0;
-static Vec2 setPieceSpot = {0.0f, 0.0f};
-static Vec2 setPieceAim = {0.0f, 0.0f};
-static bool setPieceHomeThrow = false;  // true=主队发球, false=客队发球
-enum MatchPhase {
-  PH_FIRST_HALF = 0,   // 上半场(常规)
-  PH_FIRST_STOPPO,     // 上半场补时
-  PH_HALFTIME,         // 中场休息(等待按键)
-  PH_SECOND_HALF,      // 下半场(常规)
-  PH_SECOND_STOPPO,    // 下半场补时
-  PH_FULLTIME          // 终场(等待按键重开)
+static constexpr int GAME_COUNT = 2;
+static int menuSelected = 0;        // 菜单当前选中项 0=赛车 1=空气投篮
+static int carSelectIndex = 0;     // 选车页当前轮播索引 0~8
+static bool carSelectConfirmed = false;  // 是否已选中(等待二次确认开始)
+static bool carSelectTouchPrev = false;  // 上一帧触摸状态(边沿触发防误触)
+static int  carSelectSwipeStartX = -1;    // 滑动起点 x(-1=未按下)
+static int  carSelectSwipeStartY = -1;    // 滑动起点 y
+#define CAR_SWIPE_THRESHOLD  40           // 滑动判定阈值(像素)
+static float carSelectOffset = 0.0f;     // 车辆图实时 x 偏移(触摸中跟随手指，松开后回弹/过渡)
+static bool  carSelectDragging = false;  // 是否正在拖动(触摸中)
+static float carSelectAnimFrom = 0.0f;   // 动画起点位置
+static float carSelectAnimT = 1.0f;      // 动画进度 0→1(1=完成)
+// 切换过渡动画：从 prevIndex 滑出，carSelectIndex 滑入
+static int   carSelectPrevIndex = 0;     // 切换前的车型(动画中滑出)
+static float carSelectTransT = 1.0f;     // 过渡进度 0→1(1=完成)
+static int   carSelectTransDir = 0;      // 切换方向: -1=新车从右滑入(左滑切换), +1=新车从左滑入(右滑切换)
+static int   carSelectLastX = 0;        // 最后触摸 x(松开时判断短按 vs 滑动)
+static bool  carSelectSwipeUsed = false;   // 本次手势是否已切换过(一次手势只切一辆)
+static float carSelectPos = 0.0f;        // 浮点选中位置(动画期间从 prevIndex 平滑过渡到 carSelectIndex)
+static int   carNameIndex = 0;         // 车名显示的索引(动画结束后才更新)
+static float carNameAlpha = 1.0f;      // 车名透明度(渐隐渐显)
+static bool  carNameFading = false;    // 车名是否正在渐隐
+// 9 辆车的名字(按车型顺序)
+static const char* const CAR_NAMES[9] = {
+  "Suzuki Swift",     // 0
+  "BMW 3 Series",     // 1
+  "Suzuki Vitara",    // 2
+  "Jeep Wrangler",    // 3 (玩家默认)
+  "Ford F-150",       // 4
+  "Citroen Jumper",   // 5 (去掉变音符便于显示)
+  "Porsche 718",      // 6
+  "Renault Duster",   // 7
+  "Fiat 500",         // 8
 };
-static MatchPhase matchPhase = PH_FIRST_HALF;
-static int realSecond = 0;          // 当前阶段已过的真实秒数
-static int displaySecond = 0;       // 显示用总秒数(0~90min)
-static int stoppageLen = 0;         // 本阶段补时长度(秒)，补时开始时随机生成
 
-static const int HALF_REAL_SEC = 180;              // 单半场真实 3 分钟(显示一致)
-static const int STOPPAGE_MIN = 30;                // 补时下限
-static const int STOPPAGE_MAX = 50;                // 补时上限
-
-static uint32_t lastTickMs = 0;
-static uint32_t lastClockMs = 0;
-static uint32_t messageUntil = 0;
-static uint32_t kickLockUntil = 0;
-
-// 进球庆祝状态：进球后让球飞入网内并停留一段时间再开球
-static bool celebrateActive = false;       // 是否处于进球庆祝中
-static uint32_t celebrateUntil = 0;        // 庆祝结束时间
-static bool celebratePlayerScored = false; // 本次进球是否是玩家进的上球门
-
-// 足球旋转：球在移动(带球/传球/射门)时累积旋转角度
-static float ballSpin = 0.0f;              // 当前旋转角度(弧度)
-// 最近一次踢球类型：0=带球/无, 1=传球, 2=射门。决定松球时的旋转速度
-static uint8_t lastKickType = 0;
-
-// 球员跑动步频相位：随时间累积，速度越快累积越快，用于双脚摆动动画
-static float walkPhase = 0.0f;
-
-// 进球庆祝彩纸屑(confetti)
-struct Confetti {
-  float x;
-  float y;
-  float vx;
-  float vy;
-  uint16_t color;
-  float rot;
-  float vrot;
-  int size;
-  bool active;
-};
-static const int CONFETTI_MAX = 70;
-static Confetti confetti[CONFETTI_MAX];
-// confetti 函数前向声明(定义在 drawBall 之后)
-void spawnConfetti();
-void updateConfetti(float dt);
-void drawConfetti();
-void drawGoalBanner();
-void drawMatchOverlay();
-static char messageText[28] = "TILT TO PLAY";
-
+static uint32_t lastTickMs = 0;   // 上一帧时刻(loop 计算 dt 用)
 static RawButton rawA = {KEY_A_PIN, HIGH, false, false, 0};
 static RawButton rawB = {KEY_B_PIN, HIGH, false, false, 0};
 static Vec2 touchPoint = {0.0f, 0.0f};
@@ -198,10 +118,16 @@ static int basketMade = 0;
 static bool basketShotActive = false;
 static bool basketShotMade = false;
 static bool basketShotScored = false;
+static bool basketScorePendingHighlight = false;   // 进球后等待网动画结束再高亮
+static uint32_t basketScoreHighlightUntil = 0;     // 分数高亮结束时刻(millis)
+static uint32_t basketMissShowUntil = 0;            // MISS 文字显示结束时刻(millis，与 SWISH 同时长)
 static bool basketResultReady = false;
 static uint32_t basketResultUntil = 0;
 static uint32_t basketLastShotMs = 0;
 static uint32_t basketNetAnimStart = 0;
+static uint32_t basketMissHoopStart = 0;          // Miss 时篮筐抖动动画起始时刻
+#define BASKET_MISS_FRAME_MS  90                   // Miss 篮筐动画每帧时长
+#define BASKET_MISS_TOTAL_MS  (BASKET_MISS_FRAME_MS * 6)  // Miss 动画总时长(6 步)
 static float basketBallT = 0.0f;
 static float basketBallX = 0.0f;
 static float basketBallY = 0.0f;
@@ -217,14 +143,7 @@ static float basketPower = 0.0f;
 static float basketLastAccelMag = 1.0f;
 static float basketSwingMeter = 0.0f;
 static bool basketImuReady = false;
-
-Player& controlledPlayer() {
-  if (controlled == HOME_KEEPER_CONTROL) return homeKeeper;
-  int idx = controlled;
-  if (idx < 0) idx = 0;
-  if (idx >= HOME_COUNT) idx = HOME_COUNT - 1;
-  return home[idx];
-}
+static bool speakerReady = false;
 
 float clampf(float v, float lo, float hi) {
   if (v < lo) return lo;
@@ -252,12 +171,6 @@ Vec2 normalized(Vec2 v) {
   float len = lengthOf(v);
   if (len < 0.001f) return {0.0f, -1.0f};
   return {v.x / len, v.y / len};
-}
-
-void setMessage(const char* text, uint16_t ms = 1200) {
-  strncpy(messageText, text, sizeof(messageText) - 1);
-  messageText[sizeof(messageText) - 1] = 0;
-  messageUntil = millis() + ms;
 }
 
 void fillScreen(uint16_t color) {
@@ -296,102 +209,11 @@ void rectLine(int x, int y, int w, int h, uint16_t color) {
   else M5.Display.drawRect(x, y, w, h, color);
 }
 
-int worldX(float x) {
-  return (int)roundf(x - cameraX);
-}
-
-int worldY(float y) {
-  return (int)roundf(y - cameraY);
-}
-
-Vec2 screenToWorld(Vec2 p) {
-  return {p.x + cameraX, p.y + cameraY};
-}
-
-Vec2 worldToScreen(Vec2 p) {
-  return {p.x - cameraX, p.y - cameraY};
-}
-
 Vec2 touchToScreen(int rawX, int rawY) {
   return {
     clampf((float)(rawX - screenOffsetX), 0.0f, (float)(screenW - 1)),
     clampf((float)(rawY - screenOffsetY), 0.0f, (float)(screenH - 1))
   };
-}
-
-void worldBox(float x, float y, float w, float h, uint16_t color) {
-  int sx = worldX(x);
-  int sy = worldY(y);
-  int sw = (int)ceilf(w);
-  int sh = (int)ceilf(h);
-  if (sx >= screenW || sy >= screenH || sx + sw <= 0 || sy + sh <= 0) return;
-  if (sx < 0) { sw += sx; sx = 0; }
-  if (sy < 0) { sh += sy; sy = 0; }
-  if (sx + sw > screenW) sw = screenW - sx;
-  if (sy + sh > screenH) sh = screenH - sy;
-  if (sw > 0 && sh > 0) box(sx, sy, sw, sh, color);
-}
-
-void worldCircle(Vec2 p, int r, uint16_t color) {
-  int x = worldX(p.x);
-  int y = worldY(p.y);
-  if (x < -r || y < -r || x > screenW + r || y > screenH + r) return;
-  circle(x, y, r, color);
-}
-
-void worldLine(Vec2 a, Vec2 b, uint16_t color) {
-  line(worldX(a.x), worldY(a.y), worldX(b.x), worldY(b.y), color);
-}
-
-void worldWideLine(Vec2 a, Vec2 b, int w, uint16_t color) {
-  wideLine(worldX(a.x), worldY(a.y), worldX(b.x), worldY(b.y), w, color);
-}
-
-void worldRectLine(float x, float y, float w, float h, uint16_t color) {
-  rectLine(worldX(x), worldY(y), (int)w, (int)h, color);
-}
-
-void pitchLine(Vec2 a, Vec2 b) {
-  worldWideLine(a, b, PITCH_LINE_W, C_LINE);
-}
-
-void pitchRect(float x, float y, float w, float h) {
-  pitchLine({x, y}, {x + w, y});
-  pitchLine({x + w, y}, {x + w, y + h});
-  pitchLine({x + w, y + h}, {x, y + h});
-  pitchLine({x, y + h}, {x, y});
-}
-
-void pitchCircle(float x, float y, int r) {
-  int sx = worldX(x);
-  int sy = worldY(y);
-  int half = PITCH_LINE_W / 2;
-  for (int dy = -half; dy <= half; ++dy) {
-    for (int dx = -half; dx <= half; ++dx) {
-      if (dx * dx + dy * dy > half * half + 1) continue;
-      if (useCanvas) canvas.drawCircle(sx + dx, sy + dy, r, C_LINE);
-      else M5.Display.drawCircle(sx + dx, sy + dy, r, C_LINE);
-    }
-  }
-}
-
-void updateCamera() {
-  Vec2 focus = ballPos;
-  if (ballOwner == -1) {
-    focus = add(ballPos, mul(ballVel, 22.0f));
-  } else if (ballOwner >= 0 && ballOwner < HOME_COUNT) {
-    focus.x = ballPos.x * 0.78f + home[ballOwner].pos.x * 0.22f;
-    focus.y = ballPos.y * 0.78f + home[ballOwner].pos.y * 0.22f;
-  }
-  float targetX = clampf(focus.x - screenW * 0.5f,
-                         (float)fieldLeft - SIDE_VIEW_PAD,
-                         (float)(fieldRight - screenW + SIDE_VIEW_PAD));
-  float targetY = clampf(focus.y - screenH * 0.5f,
-                         (float)fieldTop - GOAL_VIEW_PAD,
-                         (float)(fieldBottom - screenH + GOAL_VIEW_PAD));
-  float follow = (ballOwner == -1) ? 0.30f : 0.20f;
-  cameraX += (targetX - cameraX) * follow;
-  cameraY += (targetY - cameraY) * follow;
 }
 
 void textCenter(const char* text, int x, int y, const lgfx::IFont* font, uint16_t color, uint16_t bg = C_BLACK) {
@@ -445,6 +267,16 @@ extern "C" {
     if (useCanvas) canvas.drawPixel(x, y, c);
     else M5.Display.drawPixel(x, y, c);
   }
+  void gfxPushImageKeyed(int x, int y, int w, int h, const uint16_t* pixels, uint16_t transparent) {
+    const auto* rgbPixels = reinterpret_cast<const lgfx::rgb565_t*>(pixels);
+    lgfx::rgb565_t transparentRgb(transparent);
+    if (useCanvas) canvas.pushImage(x, y, w, h, rgbPixels, transparentRgb);
+    else M5.Display.pushImage(x, y, w, h, rgbPixels, transparentRgb);
+  }
+  uint16_t gfxReadPixel(int x, int y) {
+    if (useCanvas) return (uint16_t)canvas.readPixel(x, y);
+    return (uint16_t)M5.Display.readPixel(x, y);
+  }
   void gfxRoundBox(int x, int y, int w, int h, int r, uint16_t c) { roundBox(x, y, w, h, r, c); }
   void gfxRectLine(int x, int y, int w, int h, uint16_t c) { rectLine(x, y, w, h, c); }
   void gfxLine(int x0, int y0, int x1, int y1, uint16_t c) { line(x0, y0, x1, y1, c); }
@@ -458,6 +290,22 @@ extern "C" {
     if (useCanvas) canvas.fillEllipse(x, y, rx, ry, c);
     else M5.Display.fillEllipse(x, y, rx, ry, c);
   }
+  // 抗锯齿椭圆：drawEllipse 描边(LGFX 内置 AA)包住 fillEllipse 填充，边缘柔化
+  void gfxSmoothEllipse(int x, int y, int rx, int ry, uint16_t c) {
+    if (rx < 1 || ry < 1) { gfxEllipse(x, y, rx, ry, c); return; }
+    if (useCanvas) {
+      canvas.fillEllipse(x, y, rx, ry, c);
+      canvas.drawEllipse(x, y, rx, ry, c);
+    } else {
+      M5.Display.fillEllipse(x, y, rx, ry, c);
+      M5.Display.drawEllipse(x, y, rx, ry, c);
+    }
+  }
+  void gfxSmoothCircle(int x, int y, int r, uint16_t c) {
+    if (r < 1) return;
+    if (useCanvas) canvas.fillSmoothCircle(x, y, r, c);
+    else M5.Display.fillSmoothCircle(x, y, r, c);
+  }
   void gfxDrawCircle(int x, int y, int r, uint16_t c) {
     if (useCanvas) canvas.drawCircle(x, y, r, c);
     else M5.Display.drawCircle(x, y, r, c);
@@ -465,6 +313,54 @@ extern "C" {
   void gfxDrawRoundRect(int x, int y, int w, int h, int r, uint16_t c) {
     if (useCanvas) canvas.drawRoundRect(x, y, w, h, r, c);
     else M5.Display.drawRoundRect(x, y, w, h, r, c);
+  }
+  // 带 size 参数的居中文本(用 textSize 放大 Font0 实现任意字号)
+  void gfxTextCenterS(const char* s, int x, int y, int size, uint16_t c, uint16_t bg) {
+    if (useCanvas) {
+      canvas.setFont(&fonts::Font0);
+      canvas.setTextSize(size);
+      canvas.setTextDatum(textdatum_t::middle_center);
+      canvas.setTextColor(c, (bg == 0xFFFF) ? c : bg);
+      canvas.drawString(s, x, y);
+    } else {
+      M5.Display.setFont(&fonts::Font0);
+      M5.Display.setTextSize(size);
+      M5.Display.setTextDatum(textdatum_t::middle_center);
+      M5.Display.setTextColor(c, (bg == 0xFFFF) ? c : bg);
+      M5.Display.drawString(s, x, y);
+    }
+  }
+  // Font4 + size 参数：矢量字体放大，保持抗锯齿(比 Font0 缩放清晰)
+  void gfxTextCenterF4(const char* s, int x, int y, int size, uint16_t c, uint16_t bg) {
+    if (useCanvas) {
+      canvas.setFont(&fonts::Font4);
+      canvas.setTextSize(size);
+      canvas.setTextDatum(textdatum_t::middle_center);
+      canvas.setTextColor(c, (bg == 0xFFFF) ? c : bg);
+      canvas.drawString(s, x, y);
+    } else {
+      M5.Display.setFont(&fonts::Font4);
+      M5.Display.setTextSize(size);
+      M5.Display.setTextDatum(textdatum_t::middle_center);
+      M5.Display.setTextColor(c, (bg == 0xFFFF) ? c : bg);
+      M5.Display.drawString(s, x, y);
+    }
+  }
+  // 矢量字体(DejaVu24，抗锯齿清晰) + size 放大，正常大粗体
+  void gfxTextCenterBold(const char* s, int x, int y, int size, uint16_t c, uint16_t bg) {
+    if (useCanvas) {
+      canvas.setFont(&fonts::DejaVu24);
+      canvas.setTextSize(size);
+      canvas.setTextDatum(textdatum_t::middle_center);
+      canvas.setTextColor(c, (bg == 0xFFFF) ? c : bg);
+      canvas.drawString(s, x, y);
+    } else {
+      M5.Display.setFont(&fonts::DejaVu24);
+      M5.Display.setTextSize(size);
+      M5.Display.setTextDatum(textdatum_t::middle_center);
+      M5.Display.setTextColor(c, (bg == 0xFFFF) ? c : bg);
+      M5.Display.drawString(s, x, y);
+    }
   }
   void gfxTextCenter(const char* s, int x, int y, int font, uint16_t c, uint16_t bg) {
     if (useCanvas) {
@@ -479,6 +375,73 @@ extern "C" {
       }
     } else {
       textCenter(s, x, y, gfxFontById(font), c, bg);
+    }
+  }
+  // 真正的文字 Alpha：先把字形画入灰度遮罩，再将目标颜色逐像素混合到当前画面。
+  void gfxTextCenterAlpha(const char* s, int x, int y, int font, int size, uint16_t c, float alpha) {
+    alpha = constrain(alpha, 0.0f, 1.0f);
+    if (alpha <= 0.0f || !s || !*s) return;
+    const lgfx::IFont* textFont = gfxFontById(font);
+    if (alpha >= 0.995f) {
+      if (useCanvas) {
+        canvas.setFont(textFont);
+        canvas.setTextSize(size);
+        canvas.setTextDatum(textdatum_t::middle_center);
+        canvas.setTextColor(c, c);
+        canvas.drawString(s, x, y);
+      } else {
+        M5.Display.setFont(textFont);
+        M5.Display.setTextSize(size);
+        M5.Display.setTextDatum(textdatum_t::middle_center);
+        M5.Display.setTextColor(c, c);
+        M5.Display.drawString(s, x, y);
+      }
+      return;
+    }
+
+    static constexpr int MASK_W = 180;
+    static constexpr int MASK_H = 64;
+    if (!hudTextMaskReady) {
+      hudTextMask.setColorDepth(8);
+      hudTextMaskReady = hudTextMask.createSprite(MASK_W, MASK_H) != nullptr;
+    }
+    if (!hudTextMaskReady) return;
+
+    hudTextMask.fillScreen(0x0000);
+    hudTextMask.setFont(textFont);
+    hudTextMask.setTextSize(size);
+    hudTextMask.setTextDatum(textdatum_t::middle_center);
+    hudTextMask.setTextColor(0xFFFF, 0x0000);
+    hudTextMask.drawString(s, MASK_W / 2, MASK_H / 2);
+
+    int textW = min(MASK_W, (int)hudTextMask.textWidth(s) + 6);
+    int textH = min(MASK_H, (int)hudTextMask.fontHeight() + 6);
+    int mx0 = max(0, (MASK_W - textW) / 2);
+    int my0 = max(0, (MASK_H - textH) / 2);
+    int mx1 = min(MASK_W, mx0 + textW);
+    int my1 = min(MASK_H, my0 + textH);
+    int cr = (c >> 11) & 0x1F, cg = (c >> 5) & 0x3F, cb = c & 0x1F;
+
+    for (int my = my0; my < my1; ++my) {
+      int py = y + my - MASK_H / 2;
+      if (py < 0 || py >= screenH) continue;
+      for (int mx = mx0; mx < mx1; ++mx) {
+        int px = x + mx - MASK_W / 2;
+        if (px < 0 || px >= screenW) continue;
+        uint16_t maskC = (uint16_t)hudTextMask.readPixel(mx, my);
+        int mr = (maskC >> 11) & 0x1F, mg = (maskC >> 5) & 0x3F, mb = maskC & 0x1F;
+        float coverage = ((float)mr / 31.0f + (float)mg / 63.0f + (float)mb / 31.0f) / 3.0f;
+        float a = alpha * coverage;
+        if (a <= 0.002f) continue;
+        uint16_t bg = useCanvas ? (uint16_t)canvas.readPixel(px, py)
+                                : (uint16_t)M5.Display.readPixel(px, py);
+        int br = (bg >> 11) & 0x1F, bg6 = (bg >> 5) & 0x3F, bb = bg & 0x1F;
+        int r = br + (int)((cr - br) * a);
+        int g = bg6 + (int)((cg - bg6) * a);
+        int b = bb + (int)((cb - bb) * a);
+        if (useCanvas) canvas.drawPixel(px, py, (uint16_t)((r << 11) | (g << 5) | b));
+        else M5.Display.drawPixel(px, py, (uint16_t)((r << 11) | (g << 5) | b));
+      }
     }
   }
   void gfxTextLeft(const char* s, int x, int y, int font, uint16_t c, uint16_t bg) {
@@ -507,1256 +470,21 @@ void updateRawButton(RawButton& b) {
   }
 }
 
-int nearestHomeToBall() {
-  int nearest = 0;
-  float best = 100000.0f;
-  for (int i = 0; i < HOME_COUNT; ++i) {
-    float dist = lengthOf(sub(home[i].pos, ballPos));
-    if (dist < best) {
-      best = dist;
-      nearest = i;
-    }
-  }
-  return nearest;
-}
-
-void autoSelectClosestToBall() {
-  // 开球期间固定控制开球者，不自动切换
-  if (kickoffPending && kickoffPasser >= 0 && kickoffPasser < HOME_COUNT) {
-    controlled = kickoffPasser;
-    return;
-  }
-  if (ballOwner == 21) {
-    controlled = HOME_KEEPER_CONTROL;
-    return;
-  }
-
-  int nearest = nearestHomeToBall();
-  if (nearest != controlled) {
-    controlled = nearest;
-    passTarget = -1;
-  }
-  if (ballOwner >= 0 && ballOwner < HOME_COUNT && ballOwner != controlled &&
-      lengthOf(sub(home[controlled].pos, ballPos)) < 18.0f) {
-    ballOwner = controlled;
-  }
-}
-
-void readTouchControl() {
-  touchActive = false;
-  Vec2 targetInput = {0.0f, 0.0f};
-
-  if (M5.Touch.isEnabled() && M5.Touch.getCount() > 0) {
-    auto& pt = M5.Touch.getTouchPointRaw(0);
-    touchPoint = touchToScreen(pt.x, pt.y);
-    touchActive = true;
-
-    Vec2 touchWorld = screenToWorld(touchPoint);
-    Vec2 toTouch = sub(touchWorld, controlledPlayer().pos);
-    float dist = lengthOf(toTouch);
-    if (dist > 8.0f) {
-      float strength = clampf((dist - 8.0f) / 96.0f, 0.0f, 1.0f);
-      targetInput = mul(normalized(toTouch), strength);
-    }
-  }
-
-  moveInput.x = moveInput.x * 0.64f + targetInput.x * 0.36f;
-  moveInput.y = moveInput.y * 0.64f + targetInput.y * 0.36f;
-
-  if (lengthOf(moveInput) > 0.08f) {
-    lastAim = normalized(moveInput);
-  }
-}
-
-void clampToField(Vec2& p, float radius) {
-  p.x = clampf(p.x, fieldLeft + radius, fieldRight - radius);
-  p.y = clampf(p.y, fieldTop + radius, fieldBottom - radius);
-}
-
-// 随机分配发型(多发型避免全相同，光头概率低)
-void randomizeHair(Player& p) {
-  static const uint16_t colors[] = {C_HAIR_BLACK, C_HAIR_BROWN, C_HAIR_BLOND, C_HAIR_DARKBROWN};
-  p.hairStyle = rand() % 6;   // 0..5，其中 5=光头(1/6 概率)
-  p.hairColor = colors[rand() % 4];
-}
-
-void moveToward(Player& p, Vec2 target, float speed, float dt) {
-  Vec2 to = sub(target, p.pos);
-  float dist = lengthOf(to);
-  if (dist < 1.0f) {
-    p.vel = mul(p.vel, 0.82f);
-    return;
-  }
-  Vec2 desired = mul(to, speed / dist);
-  p.vel.x = p.vel.x * 0.80f + desired.x * 0.20f;
-  p.vel.y = p.vel.y * 0.80f + desired.y * 0.20f;
-  p.pos = add(p.pos, mul(p.vel, dt));
-  clampToField(p.pos, 13.0f);
-}
-
-void resetKickoff(bool playerStarts) {
-  float midX = (fieldLeft + fieldRight) * 0.5f;
-  float midY = (fieldTop + fieldBottom) * 0.5f;
-  float width = fieldRight - fieldLeft;
-  home[0] = {{midX, midY + 96.0f}, {0, 0}, 10, true};
-  home[1] = {{fieldLeft + width * 0.28f, midY + 150.0f}, {0, 0}, 7, true};
-  home[2] = {{fieldLeft + width * 0.72f, midY + 178.0f}, {0, 0}, 9, true};
-  home[3] = {{midX, midY + 210.0f}, {0, 0}, 8, true};
-
-  away[0] = {{midX, midY - 118.0f}, {0, 0}, 5, false};
-  away[1] = {{fieldLeft + width * 0.33f, midY - 170.0f}, {0, 0}, 8, false};
-  away[2] = {{fieldLeft + width * 0.67f, midY - 188.0f}, {0, 0}, 6, false};
-  away[3] = {{midX, midY - 96.0f}, {0, 0}, 11, false};
-  keeper = {{midX, fieldTop + 28.0f}, {0, 0}, 1, false};
-  homeKeeper = {{midX, fieldBottom - 28.0f}, {0, 0}, 1, true};
-
-  controlled = 0;
-  passTarget = -1;
-  moveInput = {0.0f, 0.0f};
-  // 中圈开球：两名同队球员站在中圈两侧，球归其中一人，需传给另一人才算开球
-  kickoffPending = true;
-  if (playerStarts) {
-    // 主队开球：home[0] 持球(下侧)，home[3] 接球(上侧)，两人都在中圈内
-    home[0].pos = {midX - 14.0f, midY + 8.0f};
-    home[3].pos = {midX + 14.0f, midY - 8.0f};
-    ballOwner = 0;
-    controlled = 0;
-    lastAim = {0.0f, -1.0f};
-    kickoffPasser = 0;
-    kickoffReceiver = 3;
-  } else {
-    // 客队开球：away[0] 持球(上侧)，away[3] 接球(下侧)
-    away[0].pos = {midX - 14.0f, midY - 8.0f};
-    away[3].pos = {midX + 14.0f, midY + 8.0f};
-    ballOwner = 10;
-    lastAim = {0.0f, 1.0f};
-    kickoffPasser = 10;
-    kickoffReceiver = 13;
-  }
-  ballPos = {midX, midY};
-  ballVel = {0.0f, 0.0f};
-  // 给所有球员随机分配发型
-  for (int i = 0; i < HOME_COUNT; ++i) randomizeHair(home[i]);
-  for (int i = 0; i < AWAY_COUNT; ++i) randomizeHair(away[i]);
-  randomizeHair(keeper);
-  randomizeHair(homeKeeper);
-  cameraX = clampf(ballPos.x - screenW * 0.5f,
-                   (float)fieldLeft - SIDE_VIEW_PAD,
-                   (float)(fieldRight - screenW + SIDE_VIEW_PAD));
-  cameraY = clampf(ballPos.y - screenH * 0.5f,
-                   (float)fieldTop - GOAL_VIEW_PAD,
-                   (float)(fieldBottom - screenH + GOAL_VIEW_PAD));
-}
-
-void kickBall(Vec2 from, Vec2 dir, float speed, uint8_t kickType = 1) {
-  if ((ballOwner >= 0 && ballOwner < HOME_COUNT) || ballOwner == 21) lastTouchHome = true;
-  if ((ballOwner >= 10 && ballOwner < 10 + AWAY_COUNT) || ballOwner == 20) lastTouchHome = false;
-  dir = normalized(dir);
-  ballOwner = -1;
-  ballPos = add(from, mul(dir, 18.0f));
-  ballVel = mul(dir, speed);
-  kickLockUntil = millis() + 180;
-  lastKickType = kickType;   // 记录踢球类型，用于旋转速度
-}
-
-void makePass() {
-  if (!((ballOwner >= 0 && ballOwner < HOME_COUNT) || ballOwner == 21)) return;
-  Player& p = (ballOwner == 21) ? homeKeeper : home[ballOwner];
-
-  int target = -1;
-  // 中圈开球：传给距离最近的队友
-  if (kickoffPending && ballOwner == kickoffPasser) {
-    float best = 100000.0f;
-    for (int i = 0; i < HOME_COUNT; ++i) {
-      if (i == ballOwner) continue;
-      float d = lengthOf(sub(home[i].pos, p.pos));
-      if (d < best) {
-        best = d;
-        target = i;
-      }
-    }
-  } else {
-    float best = 100000.0f;
-    for (int i = 0; i < HOME_COUNT; ++i) {
-      if (ballOwner != 21 && i == ballOwner) continue;
-      float ahead = home[i].pos.y - p.pos.y;
-      float score = fabsf(home[i].pos.x - p.pos.x) + max(0.0f, ahead + 40.0f) * 1.5f;
-      if (home[i].pos.y < p.pos.y + 28.0f) score -= 120.0f;
-      if (score < best) {
-        best = score;
-        target = i;
-      }
-    }
-  }
-  if (target < 0) return;
-
-  passTarget = target;
-  Vec2 dir = sub(home[target].pos, p.pos);
-  kickBall(p.pos, dir, 6.5f, 1);  // 传球
-  setMessage("PASS", 650);
-}
-
-void shootBall() {
-  if (!((ballOwner >= 0 && ballOwner < HOME_COUNT) || ballOwner == 21)) return;
-  Player& p = (ballOwner == 21) ? homeKeeper : home[ballOwner];
-  Vec2 target = {(fieldLeft + fieldRight) * 0.5f + lastAim.x * 110.0f, (float)fieldTop - 34.0f};
-  Vec2 touchWorld = screenToWorld(touchPoint);
-  if (touchActive && touchWorld.y < p.pos.y - 12.0f) target = touchWorld;
-  kickBall(p.pos, sub(target, p.pos), 9.2f, 2);  // 射门
-  passTarget = -1;
-  setMessage("SHOOT", 650);
-}
-
-void cpuKickDown(Player& p) {
-  Vec2 target = {(fieldLeft + fieldRight) * 0.5f, (float)fieldBottom + 26.0f};
-  target.x += (p.pos.x < (fieldLeft + fieldRight) * 0.5f) ? 70.0f : -70.0f;
-  kickBall(p.pos, sub(target, p.pos), 5.8f);
-  setMessage("INTERCEPT", 800);
-}
-
-void keeperKickUp(Player& p) {
-  Vec2 target = {(fieldLeft + fieldRight) * 0.5f, (float)fieldTop - 26.0f};
-  target.x += (p.pos.x < (fieldLeft + fieldRight) * 0.5f) ? 70.0f : -70.0f;
-  kickBall(p.pos, sub(target, p.pos), 5.8f);
-  setMessage("SAVE", 800);
-}
-
-void attachBallToOwner() {
-  if (ballOwner >= 0 && ballOwner < HOME_COUNT) {
-    Vec2 dir = lastAim;
-    if (lengthOf(moveInput) < 0.08f) dir = {0.0f, -1.0f};
-    ballPos = add(home[ballOwner].pos, mul(dir, 17.0f));
-    ballVel = {0.0f, 0.0f};
-  } else if (ballOwner >= 10 && ballOwner < 10 + AWAY_COUNT) {
-    int i = ballOwner - 10;
-    ballPos = add(away[i].pos, {0.0f, 17.0f});
-    ballVel = {0.0f, 0.0f};
-  } else if (ballOwner == 20) {
-    ballPos = add(keeper.pos, {0.0f, 16.0f});
-    ballVel = {0.0f, 0.0f};
-  } else if (ballOwner == 21) {
-    ballPos = add(homeKeeper.pos, {0.0f, -16.0f});
-    ballVel = {0.0f, 0.0f};
-  }
-}
-
-Vec2 opponentThreatPos() {
-  if (ballOwner >= 10 && ballOwner < 10 + AWAY_COUNT) return away[ballOwner - 10].pos;
-  if (ballOwner == 20) return keeper.pos;
-  return ballPos;
-}
-
-int nearestAwayTo(Vec2 p) {
-  int nearest = 0;
-  float best = 100000.0f;
-  for (int i = 0; i < AWAY_COUNT; ++i) {
-    float dist = lengthOf(sub(away[i].pos, p));
-    if (dist < best) {
-      best = dist;
-      nearest = i;
-    }
-  }
-  return nearest;
-}
-
-float homeLaneX(int i) {
-  float width = fieldRight - fieldLeft;
-  static const float lanes[HOME_COUNT] = {0.50f, 0.22f, 0.78f, 0.38f};
-  return fieldLeft + width * lanes[i % HOME_COUNT];
-}
-
-float awayLaneX(int i) {
-  float width = fieldRight - fieldLeft;
-  static const float lanes[4] = {0.28f, 0.43f, 0.57f, 0.72f};
-  return fieldLeft + width * lanes[i];
-}
-
-int homeLooseBallRunner() {
-  if (passTarget >= 0 && passTarget < HOME_COUNT) return passTarget;
-  return nearestHomeToBall();
-}
-
-int awayLooseBallRunner() {
-  int runner = 0;
-  float best = 100000.0f;
-  for (int i = 0; i < AWAY_COUNT; ++i) {
-    float dist = lengthOf(sub(away[i].pos, ballPos));
-    if (dist < best) {
-      best = dist;
-      runner = i;
-    }
-  }
-  return runner;
-}
-
-void updateHome(float dt) {
-  Player& p = controlledPlayer();
-  float mag = clampf(lengthOf(moveInput), 0.0f, 1.0f);
-  Vec2 desired = mul(normalized(moveInput), 170.0f * mag);
-  if (mag < 0.06f) desired = {0.0f, 0.0f};
-  p.vel.x = p.vel.x * 0.78f + desired.x * 0.22f;
-  p.vel.y = p.vel.y * 0.78f + desired.y * 0.22f;
-  p.pos = add(p.pos, mul(p.vel, dt));
-  clampToField(p.pos, 13.0f);
-
-  float midX = (fieldLeft + fieldRight) * 0.5f;
-  Vec2 threat = opponentThreatPos();
-  int primaryPresser = -1;
-  if (ballOwner >= 10 || ballOwner == 20) {
-    float bestPress = 100000.0f;
-    for (int i = 0; i < HOME_COUNT; ++i) {
-      if (i == controlled) continue;
-      float dist = lengthOf(sub(home[i].pos, threat));
-      if (dist < bestPress) {
-        bestPress = dist;
-        primaryPresser = i;
-      }
-    }
-  }
-  int looseRunner = (ballOwner == -1) ? homeLooseBallRunner() : -1;
-
-  for (int i = 0; i < HOME_COUNT; ++i) {
-    if (i == controlled) continue;
-    Vec2 target = home[i].pos;
-    float speed = 96.0f;
-
-    if (ballOwner == -1) {
-      if (i == looseRunner) {
-        target = add(ballPos, mul(ballVel, 18.0f));
-        speed = (i == passTarget) ? 144.0f : 132.0f;
-      } else {
-        float laneX = homeLaneX(i);
-        float supportY = ballPos.y + (i == 0 ? 118.0f : -72.0f);
-        if (ballVel.y > 0.2f) supportY = ballPos.y + 92.0f;
-        target = {laneX, clampf(supportY, fieldTop + 95.0f, fieldBottom - 85.0f)};
-        if (fabsf(target.x - ballPos.x) < 78.0f) {
-          target.x += (target.x < midX) ? -78.0f : 78.0f;
-        }
-        target.x = clampf(target.x, fieldLeft + 46.0f, fieldRight - 46.0f);
-        speed = 92.0f;
-      }
-    } else if ((ballOwner >= 0 && ballOwner < HOME_COUNT) || ballOwner == 21) {
-      Vec2 carrierPos = (ballOwner == 21) ? homeKeeper.pos : home[ballOwner].pos;
-      float laneX = homeLaneX(i);
-      float depth = (i == 0) ? 118.0f : 190.0f;
-      target = {laneX, clampf(carrierPos.y - depth, fieldTop + 90.0f, fieldBottom - 90.0f)};
-      if (i != ballOwner && lengthOf(sub(home[i].pos, ballPos)) < 160.0f) {
-        float side = (laneX < midX) ? -1.0f : 1.0f;
-        target.x = clampf(ballPos.x + side * 125.0f, fieldLeft + 45.0f, fieldRight - 45.0f);
-        target.y = clampf(ballPos.y - 118.0f, fieldTop + 90.0f, fieldBottom - 90.0f);
-      }
-      speed = 112.0f;
-    } else {
-      if (i == primaryPresser) {
-        Vec2 towardOwnGoal = normalized({midX - threat.x, (float)fieldBottom - threat.y});
-        target = add(threat, mul(towardOwnGoal, 10.0f));   // 贴近球(10px)，确保进入抢断范围
-        speed = 132.0f;
-      } else {
-        float laneX = homeLaneX(i);
-        target = {laneX, clampf(threat.y + 116.0f + i * 20.0f, fieldTop + 120.0f, fieldBottom - 80.0f)};
-        speed = 98.0f;
-      }
-    }
-    clampToField(target, 18.0f);
-    moveToward(home[i], target, speed, dt);
-  }
-}
-
-void updateAway(float dt) {
-  bool homeHasBall = (ballOwner >= 0 && ballOwner < HOME_COUNT) || ballOwner == 21;
-  int awayPresser = -1;
-  if (homeHasBall) {
-    float bestPress = 100000.0f;
-    for (int i = 0; i < AWAY_COUNT; ++i) {
-      float dist = lengthOf(sub(away[i].pos, ballPos));
-      if (dist < bestPress) {
-        bestPress = dist;
-        awayPresser = i;
-      }
-    }
-  }
-  int looseRunner = (ballOwner == -1) ? awayLooseBallRunner() : -1;
-
-  for (int i = 0; i < AWAY_COUNT; ++i) {
-    Vec2 target = away[i].pos;
-    if (homeHasBall) {
-      if (i == awayPresser) {
-        Vec2 towardOwnGoal = normalized({away[i].pos.x - (fieldLeft + fieldRight) * 0.5f, away[i].pos.y - (float)fieldTop});
-        target = add(ballPos, mul(towardOwnGoal, 10.0f));   // 贴近球(10px)，确保进入抢断范围(<18px)
-      } else {
-        float stagger = (i % 2 == 0) ? 36.0f : 82.0f;
-        target = {awayLaneX(i), clampf(ballPos.y - stagger, fieldTop + 88.0f, fieldBottom - 130.0f)};
-      }
-    } else if (ballOwner == -1) {
-      if (i == looseRunner) {
-        target = add(ballPos, mul(ballVel, 14.0f));
-      } else {
-        float coverY = ballPos.y - ((i % 2 == 0) ? 72.0f : 128.0f);
-        target = {awayLaneX(i), clampf(coverY, fieldTop + 88.0f, fieldBottom - 135.0f)};
-      }
-    } else if (ballOwner >= 10 && ballOwner < 10 + AWAY_COUNT) {
-      int carrier = ballOwner - 10;
-      if (i == carrier) {
-        target = {away[i].pos.x, away[i].pos.y + 50.0f};
-      } else {
-        float depth = (i == 3) ? 170.0f : 110.0f + (i % 2) * 54.0f;
-        target = {awayLaneX(i), clampf(away[carrier].pos.y + depth, fieldTop + 110.0f, fieldBottom - 95.0f)};
-      }
-    } else {
-      target = {awayLaneX(i), fieldTop + 135.0f + (i % 2) * 70.0f};
-    }
-    float speed = (i == awayPresser || i == looseRunner) ? 106.0f : 82.0f;
-    moveToward(away[i], target, speed, dt);
-  }
-
-  Vec2 keeperTarget = {clampf(ballPos.x, goalLeft + 18.0f, goalRight - 18.0f), fieldTop + 18.0f};
-  moveToward(keeper, keeperTarget, 130.0f, dt);
-
-  if (ballOwner != 21) {
-    Vec2 homeKeeperTarget = {clampf(ballPos.x, goalLeft + 18.0f, goalRight - 18.0f), fieldBottom - 18.0f};
-    moveToward(homeKeeper, homeKeeperTarget, 130.0f, dt);
-  }
-}
-
-int nearestHomeTo(Vec2 p) {
-  int nearest = 0;
-  float best = 100000.0f;
-  for (int i = 0; i < HOME_COUNT; ++i) {
-    float dist = lengthOf(sub(home[i].pos, p));
-    if (dist < best) {
-      best = dist;
-      nearest = i;
-    }
-  }
-  return nearest;
-}
-
-void giveHomeSetPiece(Vec2 spot, Vec2 aim, const char* label, bool outOfBounds = false) {
-  int i = nearestHomeTo(spot);
-  controlled = i;
-  ballOwner = i;
-  passTarget = -1;
-  moveInput = {0.0f, 0.0f};
-  lastAim = normalized(aim);
-  home[i].pos = sub(spot, mul(lastAim, 17.0f));
-  if (!outOfBounds) clampToField(home[i].pos, 13.0f);
-  ballPos = spot;
-  ballVel = {0.0f, 0.0f};
-  kickLockUntil = millis() + 220;
-  setMessage(label, 900);
-}
-
-void giveCpuSetPiece(Vec2 spot, const char* label, bool outOfBounds = false) {
-  int i = nearestAwayTo(spot);
-  ballOwner = 10 + i;
-  passTarget = -1;
-  away[i].pos = {spot.x, clampf(spot.y - 17.0f, fieldTop + 16.0f, fieldBottom - 16.0f)};
-  if (outOfBounds) {
-    // 界外球：球员站在场外，不拉回场内
-    away[i].pos.x = spot.x;
-  }
-  ballPos = spot;
-  ballVel = {0.0f, 0.0f};
-  kickLockUntil = millis() + 520;
-  setMessage(label, 900);
-}
-
-void restartFromSide(bool leftSide, float y) {
-  // 界外球：先定格2秒，再让发球方球员跑到边线外发球
-  setPieceState = 1;
-  setPieceUntil = millis() + 2000;
-  setPieceType = 0;   // 界外球
-  setPieceSpot = {leftSide ? fieldLeft - 14.0f : fieldRight + 14.0f,
-                  clampf(y, fieldTop + 42.0f, fieldBottom - 42.0f)};
-  setPieceAim = {leftSide ? 1.0f : -1.0f, 0.0f};
-  setPieceHomeThrow = !lastTouchHome;
-  ballVel = {0.0f, 0.0f};
-}
-
-// 定格结束：让发球方球员就位发球点
-void startSetPiece() {
-  Vec2 spot = setPieceSpot;
-  ballPos = spot;
-  ballVel = {0.0f, 0.0f};
-  if (setPieceHomeThrow) {
-    int i = nearestHomeTo(spot);
-    controlled = i;
-    ballOwner = i;
-    lastAim = setPieceAim;
-    home[i].pos = sub(spot, mul(lastAim, 17.0f));
-    if (setPieceType == 0) {
-      // 界外球：球员站场外，不拉回场内
-    } else {
-      clampToField(home[i].pos, 13.0f);
-    }
-  } else {
-    int i = nearestAwayTo(spot);
-    ballOwner = 10 + i;
-    away[i].pos = {spot.x, clampf(spot.y - 17.0f, fieldTop + 16.0f, fieldBottom - 16.0f)};
-    if (setPieceType == 0) away[i].pos.x = spot.x;  // 界外球站场外
-  }
-  passTarget = -1;
-  moveInput = {0.0f, 0.0f};
-  kickLockUntil = millis() + 400;
-  setPieceState = 2;
-}
-
-void restartFromEnd(bool topEnd, float x) {
-  bool leftCorner = x < (fieldLeft + fieldRight) * 0.5f;
-  bool homeAttackingEnd = topEnd;
-  bool cornerToHome = homeAttackingEnd && !lastTouchHome;
-  bool cornerToCpu = !homeAttackingEnd && lastTouchHome;
-
-  Vec2 spot;
-  Vec2 aim = {0.0f, 0.0f};
-  bool homeThrow;
-  if (cornerToHome) {
-    spot = {leftCorner ? fieldLeft + 18.0f : fieldRight - 18.0f, fieldTop + 18.0f};
-    aim = {leftCorner ? 0.75f : -0.75f, -1.0f};
-    homeThrow = true;
-  } else if (cornerToCpu) {
-    spot = {leftCorner ? fieldLeft + 18.0f : fieldRight - 18.0f, fieldBottom - 18.0f};
-    homeThrow = false;
-  } else if (topEnd) {
-    spot = {(fieldLeft + fieldRight) * 0.5f, fieldTop + 58.0f};
-    homeThrow = false;
-  } else {
-    spot = {(fieldLeft + fieldRight) * 0.5f, fieldBottom - 58.0f};
-    aim = {0.0f, -1.0f};
-    homeThrow = true;
-  }
-  // 角球/球门球：先定格2秒，再发球
-  setPieceState = 1;
-  setPieceUntil = millis() + 2000;
-  setPieceType = 1;   // 角球/球门球
-  setPieceSpot = spot;
-  setPieceAim = aim;
-  setPieceHomeThrow = homeThrow;
-  ballVel = {0.0f, 0.0f};
-}
-
-void updateLooseBall(float dt) {
-  if (ballOwner != -1) return;
-
-  Vec2 prevBall = ballPos;
-  ballPos = add(ballPos, mul(ballVel, 60.0f * dt));
-  ballVel = mul(ballVel, 0.986f);
-  if (lengthOf(ballVel) < 0.03f) ballVel = {0.0f, 0.0f};
-
-  const float ballR = 7.0f;
-  const float postR = 10.0f;
-  const bool nearLeftPost = fabsf(ballPos.x - goalLeft) <= postR;
-  const bool nearRightPost = fabsf(ballPos.x - goalRight) <= postR;
-  const bool insideGoalMouth = ballPos.x > goalLeft + postR && ballPos.x < goalRight - postR;
-
-  // 玩家进攻方向：球从下方越过上门线
-  if (prevBall.y >= fieldTop + ballR && ballPos.y <= fieldTop + ballR) {
-    if (insideGoalMouth) {
-      ++playerScore;
-      celebrateActive = true;
-      celebratePlayerScored = true;
-      celebrateUntil = millis() + 3000;
-      ballVel.x *= 0.5f;
-      ballVel.y = -fabsf(ballVel.y) * 0.6f;
-      spawnConfetti();
-      return;
-    }
-    if (nearLeftPost || nearRightPost) {
-      ballPos.y = fieldTop + ballR;
-      ballVel.y = fabsf(ballVel.y) * 0.72f;
-      ballVel.x = (nearLeftPost ? -fabsf(ballVel.x) : fabsf(ballVel.x)) * 1.12f;
-      return;
-    }
-    // 球从球门外越过底线(非进球非门柱) → 角球或球门球
-    restartFromEnd(true, ballPos.x);
-    return;
-  }
-
-  // CPU 进攻方向：球从上方越过下门线
-  if (prevBall.y <= fieldBottom - ballR && ballPos.y >= fieldBottom - ballR) {
-    if (insideGoalMouth) {
-      ++cpuScore;
-      celebrateActive = true;
-      celebratePlayerScored = false;
-      celebrateUntil = millis() + 3000;
-      ballVel.x *= 0.5f;
-      ballVel.y = fabsf(ballVel.y) * 0.6f;
-      spawnConfetti();
-      return;
-    }
-    if (nearLeftPost || nearRightPost) {
-      ballPos.y = fieldBottom - ballR;
-      ballVel.y = -fabsf(ballVel.y) * 0.72f;
-      ballVel.x = (nearLeftPost ? -fabsf(ballVel.x) : fabsf(ballVel.x)) * 1.12f;
-      return;
-    }
-    // 球从球门外越过底线 → 角球或球门球
-    restartFromEnd(false, ballPos.x);
-    return;
-  }
-
-  // 球进入网底后停下（贴在网里）
-  if (ballPos.y < fieldTop - GOAL_DEPTH + ballR + 2) {
-    ballPos.y = fieldTop - GOAL_DEPTH + ballR + 2;
-    ballVel = {0.0f, 0.0f};
-  }
-  if (ballPos.y > fieldBottom + GOAL_DEPTH - ballR - 2) {
-    ballPos.y = fieldBottom + GOAL_DEPTH - ballR - 2;
-    ballVel = {0.0f, 0.0f};
-  }
-
-  // 球出界（非进球方向，且非庆祝中）
-  if (ballPos.x < fieldLeft - ballR) {
-    restartFromSide(true, ballPos.y);
-    return;
-  }
-  if (ballPos.x > fieldRight + ballR) {
-    restartFromSide(false, ballPos.y);
-    return;
-  }
-}
-
-void resolvePossession() {
-  uint32_t now = millis();
-  if (now < kickLockUntil) return;
-  // 开球期间禁止抢断，只允许开球方持球
-  if (kickoffPending) return;
-  // 定位球发球期间禁止抢断(状态1定格 + 状态2发球方持球)
-  if (setPieceState != 0) return;
-
-  if (ballOwner >= 0 && ballOwner < HOME_COUNT) {
-    for (int i = 0; i < AWAY_COUNT; ++i) {
-      if (lengthOf(sub(away[i].pos, ballPos)) < 18.0f) {
-        ballOwner = 10 + i;
-        lastTouchHome = false;   // 客队抢断，记为客队触球
-        cpuKickDown(away[i]);
-        return;
-      }
-    }
-    if (lengthOf(sub(keeper.pos, ballPos)) < 18.0f && ballPos.y < fieldTop + 52.0f) {
-      ballOwner = 20;
-      lastTouchHome = false;     // 客队门将触球
-      cpuKickDown(keeper);
-      return;
-    }
-  } else if (ballOwner >= 10 && ballOwner < 10 + AWAY_COUNT) {
-    if (lengthOf(sub(homeKeeper.pos, ballPos)) < 18.0f && ballPos.y > fieldBottom - 56.0f) {
-      ballOwner = 21;
-      lastTouchHome = true;      // 主队门将触球
-      controlled = HOME_KEEPER_CONTROL;
-      passTarget = -1;
-      setMessage("KEEPER", 800);
-      return;
-    }
-  } else if (ballOwner == 21) {
-    // 主队门将持球：客队靠近可抢断
-    for (int i = 0; i < AWAY_COUNT; ++i) {
-      if (lengthOf(sub(away[i].pos, ballPos)) < 16.0f) {
-        ballOwner = 10 + i;
-        lastTouchHome = false;
-        cpuKickDown(away[i]);
-        return;
-      }
-    }
-  }
-
-  if (ballOwner == -1) {
-    for (int i = 0; i < HOME_COUNT; ++i) {
-      if (lengthOf(sub(home[i].pos, ballPos)) < 16.0f) {
-        ballOwner = i;
-        lastTouchHome = true;    // 主队捡到散球
-        controlled = i;
-        passTarget = -1;
-        return;
-      }
-    }
-    for (int i = 0; i < AWAY_COUNT; ++i) {
-      if (lengthOf(sub(away[i].pos, ballPos)) < 15.0f) {
-        ballOwner = 10 + i;
-        lastTouchHome = false;   // 客队捡到散球
-        cpuKickDown(away[i]);
-        return;
-      }
-    }
-    if (lengthOf(sub(keeper.pos, ballPos)) < 18.0f && ballPos.y < fieldTop + 56.0f) {
-      ballOwner = 20;
-      lastTouchHome = false;     // 客队门将捡到散球
-      cpuKickDown(keeper);
-      return;
-    }
-    if (lengthOf(sub(homeKeeper.pos, ballPos)) < 18.0f && ballPos.y > fieldBottom - 56.0f) {
-      ballOwner = 21;
-      lastTouchHome = true;      // 主队门将捡到散球
-      controlled = HOME_KEEPER_CONTROL;
-      passTarget = -1;
-      setMessage("KEEPER", 800);
-      return;
-    }
-  }
-}
-
-void updateBallSpin(float dt) {
-  // 球在移动(松球有速度 / 持球者正在跑)就让球旋转
-  float spinSpeed = 0.0f;
-  if (ballOwner == -1) {
-    // 松球(传球/射门)：按踢球类型分级旋转速度，都叠加球速
-    float base = lengthOf(ballVel);
-    if (lastKickType == 2) {
-      spinSpeed = base * 1.30f;   // 射门：最快
-    } else {
-      spinSpeed = base * 0.70f;   // 传球/CPU解围：中等
-    }
-  } else {
-    Vec2 carrierVel = (ballOwner >= 0 && ballOwner < HOME_COUNT) ? home[ballOwner].vel
-                   : (ballOwner == 21) ? homeKeeper.vel
-                   : (ballOwner >= 10 && ballOwner < 10 + AWAY_COUNT) ? away[ballOwner - 10].vel
-                   : keeper.vel;
-    spinSpeed = lengthOf(carrierVel) * 0.06f;       // 带球：最慢
-  }
-  ballSpin += spinSpeed * dt;
-}
-
-// 推进步频相位：取场上球员的平均速度作为节奏，跑得快步频高
-void updateWalk(float dt) {
-  float totalSpeed = 0.0f;
-  int count = 0;
-  for (int i = 0; i < HOME_COUNT; ++i) { totalSpeed += lengthOf(home[i].vel); ++count; }
-  for (int i = 0; i < AWAY_COUNT; ++i) { totalSpeed += lengthOf(away[i].vel); ++count; }
-  totalSpeed += lengthOf(homeKeeper.vel); ++count;
-  totalSpeed += lengthOf(keeper.vel); ++count;
-  float avgSpeed = totalSpeed / count;          // 像素/秒
-  // 站立时缓慢微摆(2)，跑动时按速度加快
-  walkPhase += (2.0f + avgSpeed * 0.09f) * dt;
-}
-
-// 推进比赛时钟：每真实 1 秒显示时间 +1，显示 = 真实
-// 阶段转换：上半场→补时→中场→下半场→补时→终场
-void startMatchClock() {
-  lastClockMs = millis();
-}
-
-void advanceMatchClock() {
-  if (millis() - lastClockMs < 1000) return;
-  lastClockMs += 1000;
-
-  if (matchPhase == PH_HALFTIME || matchPhase == PH_FULLTIME) return;  // 等待按键，不计时
-
-  ++realSecond;
-  if (matchPhase == PH_FIRST_HALF) {
-    displaySecond += 1;                              // 每秒 +1
-    if (realSecond >= HALF_REAL_SEC) {
-      realSecond = 0;
-      stoppageLen = STOPPAGE_MIN + (rand() % (STOPPAGE_MAX - STOPPAGE_MIN + 1));
-      matchPhase = PH_FIRST_STOPPO;
-      setMessage("STOPPAGE", 1500);
-    }
-  } else if (matchPhase == PH_FIRST_STOPPO) {
-    displaySecond += 1;                              // 补时也每秒 +1
-    if (realSecond >= stoppageLen) {
-      realSecond = 0;
-      matchPhase = PH_HALFTIME;
-      setMessage("HALF TIME", 0);
-    }
-  } else if (matchPhase == PH_SECOND_HALF) {
-    displaySecond += 1;
-    if (realSecond >= HALF_REAL_SEC) {
-      realSecond = 0;
-      stoppageLen = STOPPAGE_MIN + (rand() % (STOPPAGE_MAX - STOPPAGE_MIN + 1));
-      matchPhase = PH_SECOND_STOPPO;
-      setMessage("STOPPAGE", 1500);
-    }
-  } else if (matchPhase == PH_SECOND_STOPPO) {
-    displaySecond += 1;
-    if (realSecond >= stoppageLen) {
-      matchPhase = PH_FULLTIME;
-      setMessage("FULL TIME", 0);
-    }
-  }
-}
-
-// 开始下半场
-void startSecondHalf() {
-  realSecond = 0;
-  displaySecond = HALF_REAL_SEC;   // 下半场从 3:00(180s) 起继续累加
-  matchPhase = PH_SECOND_HALF;
-  resetKickoff(false);                 // 下半场换边，由玩家(上球门攻方)开球
-  startMatchClock();
-  setMessage("2ND HALF", 1200);
-}
-
-// 重置整场比赛(终场后重开)
-void restartMatch() {
-  playerScore = 0;
-  cpuScore = 0;
-  realSecond = 0;
-  displaySecond = 0;
-  matchPhase = PH_FIRST_HALF;
-  resetKickoff(true);
-  startMatchClock();
-  setMessage("KICK OFF", 1200);
-}
-
-void updateGame(float dt) {
-  // 中场休息 / 终场：冻结比赛，等待按键(在 loop 里检测 passPressed/shootPressed)
-  if (matchPhase == PH_HALFTIME) {
-    advanceMatchClock();
-    return;
-  }
-  if (matchPhase == PH_FULLTIME) {
-    advanceMatchClock();
-    return;
-  }
-
-  // 进球庆祝：让球停在网内约 1s，期间冻结一切持球/抢断逻辑，到点后开球
-  if (celebrateActive) {
-    readTouchControl();
-    updateLooseBall(dt);
-    updateBallSpin(dt);
-    updateConfetti(dt);
-    updateWalk(dt);
-    if (millis() >= celebrateUntil) {
-      celebrateActive = false;
-      // 进球后由失球方在中圈开球：玩家进球→CPU开球(false)，CPU进球→玩家开球(true)
-      bool concedingSideStarts = !celebratePlayerScored;
-      resetKickoff(concedingSideStarts);
-    }
-    advanceMatchClock();
-    return;
-  }
-
-  // 定位球(界外球/角球/球门球)：状态1=定格2秒等待，状态2=球员已就位发球
-  if (setPieceState == 1) {
-    readTouchControl();
-    moveInput = {0.0f, 0.0f};
-    updateWalk(dt);
-    if (millis() >= setPieceUntil) {
-      startSetPiece();
-    }
-    advanceMatchClock();
-    return;
-  }
-  // setPieceState == 2 时正常进入下方主逻辑，发球方持球后正常发球
-
-  autoSelectClosestToBall();
-  readTouchControl();
-  if (kickoffPending) {
-    if (ballOwner == -1) {
-      // 球已被踢出(传球)，开球完成
-      kickoffPending = false;
-      kickoffPasser = -1;
-      kickoffReceiver = -1;
-    } else if (ballOwner >= 10 && ballOwner < 10 + AWAY_COUNT && ballOwner == kickoffPasser) {
-      // CPU 开球：延迟约 1 秒后传给最近的客队队友
-      if (millis() > kickLockUntil + 700) {
-        Player& passer = away[kickoffPasser - 10];
-        float best = 100000.0f;
-        int recv = kickoffReceiver - 10;
-        for (int i = 0; i < AWAY_COUNT; ++i) {
-          if (10 + i == ballOwner) continue;
-          float d = lengthOf(sub(away[i].pos, passer.pos));
-          if (d < best) { best = d; recv = i; }
-        }
-        passTarget = recv;
-        Vec2 dir = sub(away[recv].pos, passer.pos);
-        kickBall(passer.pos, dir, 6.0f, 1);  // CPU 开球传球
-      }
-    } else {
-      // 玩家开球：禁止带球移动(清零输入)，等玩家按 A 传球
-      moveInput = {0.0f, 0.0f};
-    }
-  }
-
-  // 开球期间：所有球员保持静止，等球传出去后才解锁移动
-  if (kickoffPending) {
-    attachBallToOwner();
-    updateLooseBall(dt);
-    updateBallSpin(dt);
-    updateWalk(dt);
-    advanceMatchClock();
-    return;
-  }
-
-  updateHome(dt);
-  updateAway(dt);
-
-  if (ballOwner >= 10 && ballOwner < 10 + AWAY_COUNT && millis() > kickLockUntil && !kickoffPending) {
-    cpuKickDown(away[ballOwner - 10]);
-  } else if (ballOwner == 20 && millis() > kickLockUntil) {
-    cpuKickDown(keeper);
-  }
-
-  attachBallToOwner();
-  updateLooseBall(dt);
-  resolvePossession();
-  attachBallToOwner();
-  autoSelectClosestToBall();
-  updateBallSpin(dt);
-  updateWalk(dt);
-
-  // 定位球状态2：球一旦被踢出(发入场内)即完成
-  if (setPieceState == 2 && ballOwner == -1) {
-    setPieceState = 0;
-  }
-
-  advanceMatchClock();
-}
-
-void drawPitch() {
-  fillScreen(C_PITCH_1);
-  for (int y = fieldTop; y < fieldBottom; y += 76) {
-    uint16_t c = ((y / 76) & 1) ? C_PITCH_1 : C_PITCH_2;
-    worldBox(fieldLeft, y, fieldRight - fieldLeft, min(76, fieldBottom - y), c);
-  }
-
-  float midX = (fieldLeft + fieldRight) * 0.5f;
-  float midY = (fieldTop + fieldBottom) * 0.5f;
-  pitchRect(fieldLeft, fieldTop, fieldRight - fieldLeft, fieldBottom - fieldTop);
-  pitchLine({(float)fieldLeft, midY}, {(float)fieldRight, midY});
-  pitchCircle(midX, midY, 90);
-  worldCircle({midX, midY}, PITCH_LINE_W, C_LINE);
-
-  pitchRect(midX - 170, fieldTop, 340, 150);
-  pitchRect(midX - 82, fieldTop, 164, 58);
-  pitchRect(midX - 170, fieldBottom - 150, 340, 150);
-  pitchRect(midX - 82, fieldBottom - 58, 164, 58);
-
-  const int goalDepth = 40;
-  const uint16_t netBack = rgb565(205, 215, 218);
-  const uint16_t netMesh = rgb565(150, 166, 170);
-
-  // 顶部球门：球网向场外(上)延伸
-  worldBox(goalLeft - 6, fieldTop - goalDepth, goalRight - goalLeft + 12, goalDepth, netBack);
-  for (int x = goalLeft - 4; x <= goalRight + 4; x += 9)
-    worldLine({(float)x, (float)(fieldTop - goalDepth + 3)}, {(float)x, (float)(fieldTop - 2)}, netMesh);
-  for (int y = fieldTop - goalDepth + 5; y <= fieldTop - 4; y += 8)
-    worldLine({(float)(goalLeft - 4), (float)y}, {(float)(goalRight + 4), (float)y}, netMesh);
-  worldBox(goalLeft - 3, fieldTop - goalDepth, 5, goalDepth, C_WHITE);          // 左门柱
-  worldBox(goalRight - 2, fieldTop - goalDepth, 5, goalDepth, C_WHITE);         // 右门柱
-  worldBox(goalLeft - 3, fieldTop - goalDepth, goalRight - goalLeft + 6, 5, C_WHITE);  // 横梁
-
-  // 底部球门：球网向场外(下)延伸
-  worldBox(goalLeft - 6, fieldBottom, goalRight - goalLeft + 12, goalDepth, netBack);
-  for (int x = goalLeft - 4; x <= goalRight + 4; x += 9)
-    worldLine({(float)x, (float)(fieldBottom + 2)}, {(float)x, (float)(fieldBottom + goalDepth - 3)}, netMesh);
-  for (int y = fieldBottom + 4; y <= fieldBottom + goalDepth - 5; y += 8)
-    worldLine({(float)(goalLeft - 4), (float)y}, {(float)(goalRight + 4), (float)y}, netMesh);
-  worldBox(goalLeft - 3, fieldBottom, 5, goalDepth, C_WHITE);                          // 左门柱
-  worldBox(goalRight - 2, fieldBottom, 5, goalDepth, C_WHITE);                         // 右门柱
-  worldBox(goalLeft - 3, fieldBottom + goalDepth - 5, goalRight - goalLeft + 6, 5, C_WHITE);  // 横梁
-}
-
-void drawScoreboard() {
-  const int hudY = 40;
-  const int hudX = 100;
-  roundBox(10 + hudX, 5 + hudY, 108, 23, 3, C_PANEL);
-  rectLine(10 + hudX, 5 + hudY, 108, 23, C_PANEL_EDGE);
-  textCenter("BRA", 28 + hudX, 16 + hudY, &fonts::Font2, C_WHITE, C_PANEL);
-  char score[12];
-  snprintf(score, sizeof(score), "%d-%d", playerScore, cpuScore);
-  textCenter(score, 64 + hudX, 16 + hudY, &fonts::Font2, C_WHITE, C_PANEL);
-  textCenter("ENG", 100 + hudX, 16 + hudY, &fonts::Font2, C_WHITE, C_PANEL);
-
-  roundBox(38 + hudX, 28 + hudY, 52, 17, 3, C_WHITE);
-  char t[10];
-  int mm = displaySecond / 60;
-  int ss = displaySecond % 60;
-  snprintf(t, sizeof(t), "%02d:%02d", mm, ss);
-  textCenter(t, 64 + hudX, 36 + hudY, &fonts::Font2, C_BLACK, C_WHITE);
-}
-
-// 画头发(根据发型)，参数 hx/hy 为头部中心(与头部底色一致)
-// 头部底色范围：hx-7 .. hx+6 (宽14)，hy-18 .. hy-7
-void drawHair(const Player& p, int hx, int hy) {
-  uint16_t hc = p.hairColor;
-  // 头顶覆盖区域基准：宽14，从顶部向下盖若干行
-  switch (p.hairStyle) {
-    case 0: // 短发：头顶一整块，无缺口
-      box(hx - 7, hy - 18, 14, 6, hc);
-      break;
-    case 1: // 寸头：薄一层贴头顶
-      box(hx - 7, hy - 18, 14, 3, hc);
-      break;
-    case 2: // 中分：整块覆盖，中间用肤色画一条分缝线
-      box(hx - 7, hy - 18, 14, 6, hc);
-      box(hx - 1, hy - 18, 2, 6, C_SKIN);   // 中分缝
-      break;
-    case 3: // 蓬松：比头部宽一圈
-      box(hx - 8, hy - 19, 16, 8, hc);
-      box(hx - 7, hy - 12, 14, 2, hc);      // 两侧盖下来
-      break;
-    case 4: // 马尾：头顶短发 + 后侧一小撮
-      box(hx - 7, hy - 18, 14, 6, hc);
-      box(hx + 6, hy - 14, 3, 6, hc);       // 后侧马尾
-      break;
-    case 5: // 光头：头顶用肤色填满(不留透明)
-      box(hx - 7, hy - 18, 14, 3, C_SKIN);
-      break;
-    default:
-      break;
-  }
-}
-
-void drawPlayerKit(const Player& p, bool selected, uint16_t shirt, uint16_t trim, uint16_t numColor, const char* label = nullptr) {
-  int x = worldX(p.pos.x);
-  int y = worldY(p.pos.y);
-  if (x < -40 || y < -50 || x > screenW + 40 || y > screenH + 45) return;
-
-  // 跑动幅度：速度越大幅度越大，静止时近乎不动
-  float speed = lengthOf(p.vel);
-  float gait = clampf(speed / 130.0f, 0.0f, 1.0f);   // 0=站立, 1=全力跑
-  float phase = sinf(walkPhase) * gait;               // -1..1，左右脚相位差 π
-  // 朝向：向下跑(vel.y>0)→正面(看到脸)；向上跑(vel.y<0)→背面(看到后背)；静止默认正面
-  bool facingFront = !(speed > 12.0f && p.vel.y < -8.0f);
-
-  // 椭圆阴影
-  if (useCanvas) canvas.fillEllipse(x, y + 16, 13, 5, C_SHADOW);
-  else M5.Display.fillEllipse(x, y + 16, 13, 5, C_SHADOW);
-
-  // 双脚(粗腿+黑鞋)：上下交错，跑动时一只抬起一只落下；左右关于身体中心 x 对称
-  int footBaseY = y + 15;
-  int liftAmp = (int)(gait * 5.0f);
-  int leftY = footBaseY - (int)(phase * liftAmp);
-  int rightY = footBaseY + (int)(phase * liftAmp);
-  int leftX = x - 5;     // 左腿: x-5 .. x-1 (宽4)
-  int rightX = x + 1;    // 右腿: x+1 .. x+5 (宽4)，整体 x-5..x+5 关于 x 对称
-  // 短裤下的腿(肤色)
-  box(leftX, y + 7, 4, leftY - (y + 7), C_SKIN);
-  box(rightX, y + 7, 4, rightY - (y + 7), C_SKIN);
-  // 鞋(黑色方块，也关于 x 对称)
-  box(leftX - 1, leftY, 6, 4, C_BLACK);    // x-6 .. x-1
-  box(rightX, rightY, 6, 4, C_BLACK);      // x+1 .. x+6(左偏1补偿，整体居中)
-
-  // 短裤
-  box(x - 9, y + 4, 18, 5, trim);
-
-  // 球衣(方块) + 竖条纹
-  box(x - 10, y - 6, 20, 11, shirt);
-  // 两条竖条纹(用 trim 色)，跳过号码区域
-  box(x - 6, y - 6, 2, 4, trim);
-  box(x + 4, y - 6, 2, 4, trim);
-  // 衣领(只有正面才看到)
-  if (facingFront) box(x - 3, y - 7, 6, 2, C_SKIN);
-
-  // 手臂(肤色，和腿同色)：在球衣两侧，跑动时轻微摆动(与脚反向)
-  int armSwing = (int)(phase * 3.0f);    // 跑动摆动幅度
-  int armTopY = y - 4;
-  int armBotY = y + 6;
-  box(x - 13, armTopY + armSwing, 3, armBotY - armTopY, C_SKIN);   // 左臂(随相位下移)
-  box(x + 10, armTopY - armSwing, 3, armBotY - armTopY, C_SKIN);   // 右臂(反向)
-
-  // 头部(方块) + 头发
-  box(x - 7, y - 18, 14, 12, C_SKIN);
-  box(x - 7, y - 18, 14, 2, C_SKIN_DARK);  // 头顶阴影
-  drawHair(p, x, y);   // 传头部基准(发型内部用 y-18 对齐头顶)
-  // 面部：正面才画眼睛，背面不画(后脑勺)
-  if (facingFront) {
-    box(x - 4, y - 13, 2, 2, C_BLACK);
-    box(x + 2, y - 13, 2, 2, C_BLACK);
-  }
-
-  // 号码 / 标签：正面印胸前(中部)，背面印后背(上部)
-  char num[4];
-  if (label) snprintf(num, sizeof(num), "%s", label);
-  else snprintf(num, sizeof(num), "%u", p.number);
-  int numY = facingFront ? (y + 1) : (y - 4);   // 正面中部 / 背面上部
-  textCenter(num, x, numY, &fonts::Font0, numColor, shirt);
-
-  if (selected) {
-    // 倒三角(▼，顶点朝下指向球员)，距头顶 4px
-    if (useCanvas) canvas.fillTriangle(x, y - 28, x - 8, y - 40, x + 8, y - 40, C_ACCENT);
-    else M5.Display.fillTriangle(x, y - 28, x - 8, y - 40, x + 8, y - 40, C_ACCENT);
-  }
-}
-
-void drawPlayer(const Player& p, bool selected) {
-  uint16_t shirt = p.home ? C_YELLOW : C_RED;
-  uint16_t trim = p.home ? C_BLUE : C_RED_DARK;
-  uint16_t numColor = p.home ? C_BLACK : C_WHITE;
-  drawPlayerKit(p, selected, shirt, trim, numColor);
-}
-
-void drawKeeper(const Player& p, bool homeSide, bool selected = false) {
-  uint16_t shirt = homeSide ? C_KEEPER_HOME : C_KEEPER_AWAY;
-  uint16_t trim = homeSide ? C_BLUE_DARK : C_ORANGE;
-  uint16_t numColor = homeSide ? C_BLACK : C_WHITE;
-  drawPlayerKit(p, selected, shirt, trim, numColor);   // 守门员也显示号码(=1)，不用 GK
-}
-
-void drawBall() {
-  int x = worldX(ballPos.x);
-  int y = worldY(ballPos.y);
-  if (x < -24 || y < -24 || x > screenW + 24 || y > screenH + 24) return;
-
-  static const char* sprite[17] = {
-    ".....KKKKKKK.....",
-    "...KKWWWWWWWKK...",
-    "..KWWWWGWWWWWWK..",
-    ".KWWKKGWWWKKWWWK.",
-    ".KWKBBKWWKBBKWWK.",
-    "KWWKBBKGWKBBKWWWK",
-    "KWWWKKGWWGKKWWWWK",
-    "KWWWWGGKKGGWWWWWK",
-    "KWWWWKBBBBKWWWWWK",
-    "KWWWWKBBBBKGWWWWK",
-    "KWWWGGKBBKGGWWWWK",
-    "KWWKKWGKKGWKKWWWK",
-    ".KWKBBWWWWWBBKWK.",
-    ".KWWKKWWWWWKKWWK.",
-    "..KWWWWGGWWWWWK..",
-    "...KKWWWWWWWKK...",
-    ".....KKKKKKK....."
-  };
-
-  // 阴影(不随球旋转)
-  box(x - 6, y + 9, 15, 4, C_SHADOW);
-
-  // 旋转球体：把 17x17 sprite 每个像素绕中心旋转 ballSpin 弧度
-  const int R = 8;
-  const float c = cosf(ballSpin);
-  const float s = sinf(ballSpin);
-  for (int dy = -R; dy <= R; ++dy) {
-    for (int dx = -R; dx <= R; ++dx) {
-      // 落在圆形内的目标像素才画
-      if (dx * dx + dy * dy > R * R) continue;
-      // 反向映射到源 sprite 坐标
-      float sx =  dx * c + dy * s;
-      float sy = -dx * s + dy * c;
-      int srcCol = (int)lroundf(sx) + R;
-      int srcRow = (int)lroundf(sy) + R;
-      if (srcCol < 0 || srcCol >= 17 || srcRow < 0 || srcRow >= 17) continue;
-      char p = sprite[srcRow][srcCol];
-      if (p == '.') continue;
-      uint16_t color;
-      if (p == 'K' || p == 'B') color = C_BLACK;
-      else if (p == 'G') color = C_BALL_GRAY;
-      else if (p == 'W') color = C_WHITE;
-      else continue;
-      if (p == 'W' && srcCol > 12 && srcRow > 3 && srcRow < 14) color = C_BALL_LIGHT;
-      box(x + dx, y + dy, 1, 1, color);
-    }
-  }
-}
-
-// ---- 进球庆祝彩纸屑 ----
-void spawnConfetti() {
-  // 从屏幕顶部两侧散落
-  static const uint16_t colors[] = {
-    C_YELLOW, C_RED, C_BLUE, C_ACCENT, C_ORANGE, C_KEEPER_HOME, C_WHITE
-  };
-  static const int nColors = sizeof(colors) / sizeof(colors[0]);
-  for (int i = 0; i < CONFETTI_MAX; ++i) {
-    if (!confetti[i].active) {
-      confetti[i].active = true;
-      confetti[i].x = (float)(rand() % screenW);
-      confetti[i].y = -10.0f - (float)(rand() % 80);
-      confetti[i].vx = ((float)(rand() % 100) - 50.0f) * 0.6f;
-      confetti[i].vy = 40.0f + (float)(rand() % 70);
-      confetti[i].color = colors[rand() % nColors];
-      confetti[i].rot = (float)(rand() % 360) * (3.14159265f / 180.0f);
-      confetti[i].vrot = ((float)(rand() % 100) - 50.0f) * 0.05f;
-      confetti[i].size = 3 + (rand() % 4);
-    }
-  }
-}
-
-void updateConfetti(float dt) {
-  for (int i = 0; i < CONFETTI_MAX; ++i) {
-    if (!confetti[i].active) continue;
-    confetti[i].vy += 60.0f * dt;            // 重力
-    confetti[i].vx *= (1.0f - 0.8f * dt);    // 空气阻力(水平)
-    confetti[i].x += confetti[i].vx * dt;
-    confetti[i].y += confetti[i].vy * dt;
-    confetti[i].rot += confetti[i].vrot;
-    if (confetti[i].y > screenH + 20) confetti[i].active = false;
-  }
-}
-
-void drawConfetti() {
-  for (int i = 0; i < CONFETTI_MAX; ++i) {
-    if (!confetti[i].active) continue;
-    int x = (int)confetti[i].x;
-    int y = (int)confetti[i].y;
-    int s = confetti[i].size;
-    // 用旋转角度模拟翻面：奇偶周期切换为细条/方块，营造纸片翻转感
-    float r = fmodf(fabsf(confetti[i].rot), 2.0f * 3.14159265f);
-    float shrink = cosf(r);                  // -1..1，越接近0越窄(侧视)
-    int w = s;
-    int h = s;
-    if (fabsf(shrink) < 0.55f) w = 1;        // 侧视时变细条
-    box(x - w / 2, y - h / 2, w, h, confetti[i].color);
-  }
-}
-
-void drawGoalBanner() {
-  // 屏幕中间黄底黑字 GOAL
-  const int bw = 240;
-  const int bh = 70;
-  int bx = screenW / 2 - bw / 2;
-  int by = screenH / 2 - bh / 2;
-  roundBox(bx, by, bw, bh, 10, C_YELLOW);
-  rectLine(bx, by, bw, bh, C_BLACK);
-  textCenter("GOAL!", screenW / 2, screenH / 2, &fonts::Font4, C_BLACK, C_YELLOW);
-}
-
-// 中场休息 / 终场覆盖层
-void drawMatchOverlay() {
-  // 半透明遮罩
-  box(0, 0, screenW, screenH, rgb565(10, 14, 12));
-  const int bw = 300;
-  const int bh = 150;
-  int bx = screenW / 2 - bw / 2;
-  int by = screenH / 2 - bh / 2;
-
-  bool fulltime = (matchPhase == PH_FULLTIME);
-  const char* title = fulltime ? "FULL TIME" : "HALF TIME";
-  uint16_t titleColor = fulltime ? C_RED : C_ACCENT;
-
-  roundBox(bx, by, bw, bh, 12, C_PANEL);
-  rectLine(bx, by, bw, bh, C_PANEL_EDGE);
-  textCenter(title, screenW / 2, by + 34, &fonts::Font4, titleColor, C_PANEL);
-
-  char score[20];
-  snprintf(score, sizeof(score), "BRA %d - %d ENG", playerScore, cpuScore);
-  textCenter(score, screenW / 2, by + 78, &fonts::Font4, C_WHITE, C_PANEL);
-
-  const char* hint = fulltime ? "Press A/B to restart" : "Press A/B for 2nd half";
-  textCenter(hint, screenW / 2, by + 122, &fonts::Font2, C_YELLOW, C_PANEL);
-}
-
-void drawTouchIndicator() {
-  // 摇杆指示器已隐藏(触摸控制功能保留，由 readTouchControl 单独处理)
-}
-
-void drawGame() {
-  updateCamera();
-  drawPitch();
-  for (int i = 0; i < AWAY_COUNT; ++i) drawPlayer(away[i], false);
-  drawKeeper(keeper, false);
-  drawKeeper(homeKeeper, true, controlled == HOME_KEEPER_CONTROL);
-  for (int i = 0; i < HOME_COUNT; ++i) drawPlayer(home[i], i == controlled);
-  drawBall();
-  drawTouchIndicator();
-  drawScoreboard();
-  if (celebrateActive) {
-    drawConfetti();
-    drawGoalBanner();
-  }
-  if (matchPhase == PH_HALFTIME || matchPhase == PH_FULLTIME) {
-    drawMatchOverlay();
-  }
-  pushFrame();
-}
-
 void basketInit() {
+  M5.Power.setVibration(0);   // 保险：重置游戏时关震动，避免退出后马达继续转
   basketScore = 0;
   basketAttempts = 0;
   basketMade = 0;
   basketShotActive = false;
   basketShotMade = false;
   basketShotScored = false;
+  basketScorePendingHighlight = false;
+  basketScoreHighlightUntil = 0;
+  basketMissShowUntil = 0;
   basketResultReady = false;
   basketResultUntil = 0;
   basketNetAnimStart = 0;
+  basketMissHoopStart = 0;
   basketLastShotMs = 0;
   basketBallX = screenW / 2.0f;
   basketBallY = screenH - 80.0f;
@@ -1798,6 +526,9 @@ void basketStartShot(float power) {
   basketAttempts++;
   basketResultReady = false;
   basketShotScored = false;
+  basketMissShowUntil = 0;        // 新投篮开始：清掉残留 MISS 文字计时
+  basketMissHoopStart = 0;        // 新投篮开始：清掉残留篮筐抖动动画
+  basketScoreHighlightUntil = 0;  // 新投篮开始：清掉残留分数高亮
 
   float quality = 1.0f - fabsf(power - 1.35f) * 0.42f;
   quality = clampf(quality, 0.0f, 1.0f);
@@ -1821,6 +552,38 @@ void basketStartShot(float power) {
   basketBallT = 0.0f;
   basketSpin = 0.0f;
   basketShotActive = true;
+}
+
+void playShotSound() {
+  if (!speakerReady) return;
+  M5.Speaker.playRaw(SHOT_SOUND_DATA, SHOT_SOUND_LEN, SHOT_SOUND_SAMPLE_RATE, false, 1, 0, true);
+}
+
+void playMissSound() {
+  if (!speakerReady) return;
+  M5.Speaker.playRaw(MISS_SOUND_DATA, MISS_SOUND_LEN, MISS_SOUND_SAMPLE_RATE, false, 1, 0, true);
+}
+
+// ---- 选车场景背景音乐 ----
+// BGM 用固定虚拟通道，音效用 channel=-1 自动分配，两者互不影响。
+static constexpr int BGM_CHANNEL = 1;        // BGM 固定通道(避开音效自动分配)
+static constexpr uint8_t BGM_VOLUME = 96;    // BGM 音量(低于主音量255，不盖过音效)
+static bool bgmPlaying = false;
+
+void startCarSelectBgm() {
+  if (!speakerReady || bgmPlaying) return;
+  M5.Speaker.setChannelVolume(BGM_CHANNEL, BGM_VOLUME);
+  // repeat=0 在 M5Unified 内部转为 ~0u(无限循环)；用固定通道不抢占音效
+  M5.Speaker.playRaw(BGM_SELECT_DATA, BGM_SELECT_LEN,
+                     BGM_SELECT_SAMPLE_RATE, false, 0,
+                     BGM_CHANNEL, false);
+  bgmPlaying = true;
+}
+
+void stopCarSelectBgm() {
+  if (!bgmPlaying) return;
+  M5.Speaker.stop(BGM_CHANNEL);
+  bgmPlaying = false;
 }
 
 void basketUpdate(float dt, bool shootInput) {
@@ -1852,10 +615,10 @@ void basketUpdate(float dt, bool shootInput) {
         basketBallY = 138.0f + fall * 96.0f;
         if (!basketShotScored) {
           basketShotScored = true;
-          basketMade++;
-          basketScore += 2;
           basketNetAnimStart = millis();
-          if (basketScore > basketBest) basketBest = basketScore;
+          basketScorePendingHighlight = true;   // 网动画播完后再加分+高亮
+          playShotSound();
+          M5.Power.setVibration(200);            // 进球震动：强档(随网动画开始)
         }
       } else {
         basketBallY = basketEndY + fall * fall * 360.0f;
@@ -1866,11 +629,25 @@ void basketUpdate(float dt, bool shootInput) {
       basketShotActive = false;
       basketResultReady = true;
       basketResultUntil = millis() + 900;
+      if (!basketShotMade) {
+        playMissSound();
+        basketMissShowUntil = millis() + 3000;   // MISS 显示时长与 SWISH/高亮一致(3s)
+        basketMissHoopStart = millis();          // 启动篮筐抖动动画(用 0/1/5 帧)
+      }
     }
   }
 
   if (basketNetAnimStart != 0 && millis() - basketNetAnimStart >= (uint32_t)(BASKET_HOOP_FRAMES * BASKET_HOOP_FRAME_MS)) {
     basketNetAnimStart = 0;
+    M5.Power.setVibration(0);                  // 网动画结束：关震动
+    // 网动画播完：此时再加分 + 触发高亮(分数变化滞后于篮筐动效)
+    if (basketScorePendingHighlight) {
+      basketScorePendingHighlight = false;
+      basketMade++;
+      basketScore += 2;
+      if (basketScore > basketBest) basketBest = basketScore;
+      basketScoreHighlightUntil = millis() + 3000;   // 渐显0.4+保持2.2+渐隐0.4
+    }
   }
 
   if (basketResultReady && millis() > basketResultUntil) {
@@ -1896,7 +673,15 @@ void drawBasketHoop() {
   int y0 = -30;
   int frame = 0;
   if (basketNetAnimStart != 0) {
+    // 进球：网动画，0→N 线性遍历
     frame = min(BASKET_HOOP_FRAMES - 1, (int)((millis() - basketNetAnimStart) / BASKET_HOOP_FRAME_MS));
+  } else if (basketMissHoopStart != 0) {
+    // Miss：篮筐被撞抖动，用 0/1/5 三帧序列(撞→回弹→静止)
+    // 6 步序列：0 → 1 → 5 → 1 → 0 → 0
+    static const uint8_t missSeq[6] = {0, 1, 5, 1, 0, 0};
+    int step = (int)((millis() - basketMissHoopStart) / BASKET_MISS_FRAME_MS);
+    if (step >= 6) step = 5;
+    frame = missSeq[step];
   }
   for (int y = 0; y < BASKET_HOOP_H; ++y) {
     int sy = y0 + y;
@@ -1914,7 +699,54 @@ void drawBasketHoop() {
   }
 }
 
-void drawSevenSegment(int x, int y, int w, int h, int digit, uint16_t c) {
+void drawSegBarCore(float cx, float cy, float len, float thick, bool horiz, uint16_t color) {
+  float half = len * 0.5f;
+  float ht = thick * 0.5f;
+  float bevel = thick * 0.56f;
+  auto tri = [&](float ax, float ay, float bx, float by, float ex, float ey) {
+    int iax = (int)roundf(ax);
+    int iay = (int)roundf(ay);
+    int ibx = (int)roundf(bx);
+    int iby = (int)roundf(by);
+    int iex = (int)roundf(ex);
+    int iey = (int)roundf(ey);
+    if (useCanvas) canvas.fillTriangle(iax, iay, ibx, iby, iex, iey, color);
+    else M5.Display.fillTriangle(iax, iay, ibx, iby, iex, iey, color);
+  };
+  if (horiz) {
+    int x = (int)roundf(cx - half + bevel);
+    int y = (int)roundf(cy - thick * 0.5f);
+    int w = (int)roundf(len - bevel * 2.0f);
+    int h = (int)roundf(thick);
+    box(x, y, w, h, color);
+    tri(cx - half, cy, cx - half + bevel, cy - ht, cx - half + bevel, cy + ht);
+    tri(cx + half, cy, cx + half - bevel, cy - ht, cx + half - bevel, cy + ht);
+  } else {
+    int x = (int)roundf(cx - thick * 0.5f);
+    int y = (int)roundf(cy - half + bevel);
+    int w = (int)roundf(thick);
+    int h = (int)roundf(len - bevel * 2.0f);
+    box(x, y, w, h, color);
+    tri(cx, cy - half, cx - ht, cy - half + bevel, cx + ht, cy - half + bevel);
+    tri(cx, cy + half, cx - ht, cy + half - bevel, cx + ht, cy + half - bevel);
+  }
+}
+
+void drawSegBar(float cx, float cy, float len, float thick, bool horiz, bool active, uint16_t lit) {
+  if (!active) return;
+  uint16_t outline = C_BLACK;
+  drawSegBarCore(cx - 2.0f, cy, len, thick, horiz, outline);
+  drawSegBarCore(cx + 2.0f, cy, len, thick, horiz, outline);
+  drawSegBarCore(cx, cy - 2.0f, len, thick, horiz, outline);
+  drawSegBarCore(cx, cy + 2.0f, len, thick, horiz, outline);
+  drawSegBarCore(cx - 1.4f, cy - 1.4f, len, thick, horiz, outline);
+  drawSegBarCore(cx + 1.4f, cy - 1.4f, len, thick, horiz, outline);
+  drawSegBarCore(cx - 1.4f, cy + 1.4f, len, thick, horiz, outline);
+  drawSegBarCore(cx + 1.4f, cy + 1.4f, len, thick, horiz, outline);
+  drawSegBarCore(cx, cy, len, thick, horiz, lit);
+}
+
+void drawSevenSegment(int x, int y, int w, int h, int digit, uint16_t lit) {
   static const uint8_t segs[10] = {
     0b0111111, // 0
     0b0000110, // 1
@@ -1928,21 +760,91 @@ void drawSevenSegment(int x, int y, int w, int h, int digit, uint16_t c) {
     0b1101111  // 9
   };
   if (digit < 0 || digit > 9) return;
-  int t = max(8, w / 7);
-  int mid = y + h / 2;
+  float t = max(w * 0.105f, h * 0.064f);
+  t = max(t, 12.0f);
+  float gap = t * 1.55f;
+  float mid = y + h * 0.5f;
+  float overlap = t * 0.36f;
+  float hLen = w - 2.0f * gap + overlap * 2.0f;
+  float vLen = h * 0.5f - 2.0f * gap + overlap * 2.0f;
   uint8_t s = segs[digit];
-  auto segLine = [&](int bit, int x0, int y0, int x1, int y1) {
-    if (!(s & (1 << bit))) return;
-    wideLine(x0, y0, x1, y1, t, c);   // 只画本体颜色，无黑色描边
+  auto seg = [&](int bit, float cx, float cy, float len, bool horiz) {
+    drawSegBar(cx, cy, len, t, horiz, (s & (1 << bit)), lit);
   };
-  segLine(0, x + t, y, x + w - t, y);             // A
-  segLine(1, x + w, y + t, x + w, mid - t);       // B
-  segLine(2, x + w, mid + t, x + w, y + h - t);   // C
-  segLine(3, x + t, y + h, x + w - t, y + h);     // D
-  segLine(4, x, mid + t, x, y + h - t);           // E
-  segLine(5, x, y + t, x, mid - t);               // F
-  segLine(6, x + t, mid, x + w - t, mid);         // G
+  seg(0, x + w * 0.5f, y + gap,                 hLen, true);
+  seg(1, x + w - gap,   y + h * 0.255f,         vLen, false);
+  seg(2, x + w - gap,   y + h * 0.745f,         vLen, false);
+  seg(3, x + w * 0.5f, y + h - gap,             hLen, true);
+  seg(4, x + gap,       y + h * 0.745f,         vLen, false);
+  seg(5, x + gap,       y + h * 0.255f,         vLen, false);
+  seg(6, x + w * 0.5f, mid,                     hLen, true);
 }
+
+// 7 列 × 10 行 点阵字模(每个数字 70 位，行优先)，1=点亮
+// 高分辨率粗黑体，贴近真实 LED 记分牌大屏，识别性强
+static const uint16_t DOT_MATRIX[10][10] = {
+  // 0
+  {0b0111110, 0b1111111, 0b1100011, 0b1100011, 0b1100011, 0b1100011, 0b1100011, 0b1100011, 0b1111111, 0b0111110},
+  // 1
+  {0b0001100, 0b0011100, 0b0111100, 0b0001100, 0b0001100, 0b0001100, 0b0001100, 0b0001100, 0b0001100, 0b1111111},
+  // 2
+  {0b0111110, 0b1111111, 0b0000011, 0b0000110, 0b0001100, 0b0011000, 0b0110000, 0b1100000, 0b1111111, 0b1111111},
+  // 3
+  {0b1111110, 0b1111111, 0b0000011, 0b0000110, 0b0011110, 0b0000110, 0b0000011, 0b0000011, 0b1111111, 0b1111100},
+  // 4
+  {0b0001110, 0b0011110, 0b0110110, 0b1100110, 0b1100110, 0b1111111, 0b1111111, 0b0000110, 0b0000110, 0b0000110},
+  // 5
+  {0b1111111, 0b1111111, 0b1100000, 0b1100000, 0b1111110, 0b0000011, 0b0000011, 0b0000011, 0b1111111, 0b1111100},
+  // 6
+  {0b0011110, 0b0111000, 0b1100000, 0b1100000, 0b1111110, 0b1100011, 0b1100011, 0b1100011, 0b1111111, 0b0111110},
+  // 7
+  {0b1111111, 0b1111111, 0b0000011, 0b0000110, 0b0001100, 0b0011000, 0b0110000, 0b0110000, 0b0110000, 0b0110000},
+  // 8
+  {0b0111110, 0b1111111, 0b1100011, 0b1100011, 0b0111110, 0b1100011, 0b1100011, 0b1100011, 0b1111111, 0b0111110},
+  // 9
+  {0b0111110, 0b1111111, 0b1100011, 0b1100011, 0b0111111, 0b0000011, 0b0000011, 0b0000110, 0b0011100, 0b0111100},
+};
+
+// 画一个点阵 LED 数字：7×10 大圆点，相邻点轻微重叠 + 抗锯齿，边缘圆滑无锯齿。
+// pad=圆点相对格子的收缩(0=刚好相切略有重叠，>0 留缝隙显颗粒感)。
+void drawDotMatrixDigit(int x, int y, int w, int h, int digit, uint16_t lit, float pad = 0.0f) {
+  if (digit < 0 || digit > 9) return;
+  const int COLS = 7, ROWS = 10;
+  float cellW = (float)w / COLS;
+  float cellH = (float)h / ROWS;
+  // 圆点直径取格子较小边，再 +6% 让相邻点重叠、消除断阶；pad 收缩则变稀疏
+  float r = min(cellW, cellH) * (0.53f - pad);
+  for (int row_i = 0; row_i < ROWS; ++row_i) {
+    uint16_t row = DOT_MATRIX[digit][row_i];
+    for (int c = 0; c < COLS; ++c) {
+      if (!(row & (1 << (COLS - 1 - c)))) continue;
+      float cx = x + (c + 0.5f) * cellW;
+      float cy = y + (row_i + 0.5f) * cellH;
+      // fillSmoothCircle 自带抗锯齿，边缘柔和
+      if (useCanvas) canvas.fillSmoothCircle((int)cx, (int)cy, (int)r, lit);
+      else M5.Display.fillSmoothCircle((int)cx, (int)cy, (int)r, lit);
+    }
+  }
+}
+
+// 在两个 RGB565 颜色间线性插值。t∈[0,1]：0=c0, 1=c1。
+// 先拆回 565 再线性混合，避免直接按位运算导致色阶跳变。
+static inline uint16_t lerpRGB565(uint16_t c0, uint16_t c1, float t) {
+  if (t <= 0.0f) return c0;
+  if (t >= 1.0f) return c1;
+  int r0 = (c0 >> 11) & 0x1F, g0 = (c0 >> 5) & 0x3F, b0 = c0 & 0x1F;
+  int r1 = (c1 >> 11) & 0x1F, g1 = (c1 >> 5) & 0x3F, b1 = c1 & 0x1F;
+  int r = r0 + (int)((r1 - r0) * t);
+  int g = g0 + (int)((g1 - g0) * t);
+  int b = b0 + (int)((b1 - b0) * t);
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+// 高亮过渡时长(毫秒)：渐显 + 保持 + 渐隐 = 总 3s
+#define SCORE_FADE_IN_MS   400
+#define SCORE_HOLD_MS     2200
+#define SCORE_FADE_OUT_MS 400
+#define SCORE_TOTAL_MS    (SCORE_FADE_IN_MS + SCORE_HOLD_MS + SCORE_FADE_OUT_MS)
 
 void drawBasketScoreBehindHoop() {
   char score[6];
@@ -1952,66 +854,69 @@ void drawBasketScoreBehindHoop() {
     memmove(score, score + len - 3, 4);
     len = 3;
   }
-  // 数字等比缩小(高 320→220，比例 0.6875)
-  int digitH = 220;
-  int gap = 48;                                   // 数字间距
-  int digitW = (len >= 3) ? 82 : 103;             // 120×0.6875≈82, 150×0.6875≈103
+  // 点阵 LED：7列×10行，外框尺寸(宽高比 ≈ 0.7)
+  int digitH = 280;
+  int gap = 24;
+  int digitW = (len >= 3) ? 108 : 168;       // 7列，宽 = 高×0.6 左右
   int totalW = len * digitW + (len - 1) * gap;
   int x = screenW / 2 - totalW / 2;
-  int y = (screenH - digitH) / 2 - 4 - 40;          // 往上移动40px
-  // 白色 60% 透明度(255×0.6≈153，保持蓝灰色调按比例缩放)
-  uint16_t translucentWhite = rgb565(153, 163, 172);
+  int y = (screenH - digitH) / 2 - 34;
+  // 记分牌配色(渐变高亮)
+  // 渐变高亮：暗灰 →(0.4s)→ 亮黄 →(2.2s)→ 亮黄 →(0.4s)→ 暗灰
+  const uint16_t cDim = rgb565(0x1A, 0x1A, 0x1A);   // #1A1A1A 近黑深灰(常态)
+  const uint16_t cHot = rgb565(255, 220, 90);       // 暖黄(高亮)
+  uint16_t lit;
+  if (basketScoreHighlightUntil != 0) {
+    uint32_t elapsed = millis() - (basketScoreHighlightUntil - SCORE_TOTAL_MS);
+    if (elapsed >= SCORE_TOTAL_MS) {
+      basketScoreHighlightUntil = 0;                // 过期清零
+      lit = cDim;
+    } else if (elapsed < SCORE_FADE_IN_MS) {
+      lit = lerpRGB565(cDim, cHot, (float)elapsed / SCORE_FADE_IN_MS);        // 渐显
+    } else if (elapsed < SCORE_FADE_IN_MS + SCORE_HOLD_MS) {
+      lit = cHot;                                   // 保持全亮
+    } else {
+      uint32_t fe = elapsed - SCORE_FADE_IN_MS - SCORE_HOLD_MS;
+      lit = lerpRGB565(cHot, cDim, (float)fe / SCORE_FADE_OUT_MS);            // 渐隐
+    }
+  } else {
+    lit = cDim;
+  }
   for (int i = 0; i < len; ++i) {
-    drawSevenSegment(x + i * (digitW + gap), y, digitW, digitH, score[i] - '0', translucentWhite);
+    drawDotMatrixDigit(x + i * (digitW + gap), y, digitW, digitH, score[i] - '0', lit);
   }
 }
 
 void drawBasketGame() {
   uint16_t bg = C_BLACK;
   fillScreen(bg);
-  box(0, screenH - 132, screenW, 132, rgb565(188, 118, 56));
-  wideLine(0, screenH - 132, screenW, screenH - 132, 4, rgb565(238, 214, 164));
-  rectLine(screenW / 2 - 72, screenH - 126, 144, 116, rgb565(238, 214, 164));
-  circle(screenW / 2, screenH - 68, 36, rgb565(238, 214, 164));
-  box(screenW / 2 - 34, screenH - 126, 68, 4, rgb565(238, 214, 164));
 
   drawBasketScoreBehindHoop();
   drawBasketHoop();
 
-  int meterW = 126;
-  int meterX = screenW / 2 - meterW / 2;
-  int meterY = screenH - 38;
-  roundBox(meterX, meterY, meterW, 12, 6, rgb565(48, 56, 62));
-  box(meterX + 3, meterY + 3, (int)((meterW - 6) * clampf(basketSwingMeter, 0.0f, 1.0f)), 6, C_YELLOW);
-
   textLeft("AIR SHOT", 12, 10, &fonts::Font4, C_WHITE, bg);
   char buf[48];
   snprintf(buf, sizeof(buf), "%d/%d", basketMade, basketAttempts);
-  textLeft("MADE", screenW - 82, 46, &fonts::Font0, C_DIM, bg);
-  textLeft(buf, screenW - 82, 58, &fonts::Font2, C_WHITE, bg);
+  textCenter("MADE", screenW / 2, 8, &fonts::Font0, C_DIM, bg);
+  textCenter(buf, screenW / 2, 31, &fonts::Font4, C_WHITE, bg);
   textLeft("B=MENU", screenW - 74, 12, &fonts::Font0, C_WHITE, bg);
 
-  if (!basketShotActive) {
-    drawBasketBall((int)basketBallX, (int)basketBallY, (int)basketBallR);
-  }
-  if (basketShotActive) {
-    for (float t = 0.15f; t < min(1.0f, basketBallT); t += 0.18f) {
-      float u = 1.0f - t;
-      int px = (int)(u * u * basketStartX + 2.0f * u * t * basketCtrlX + t * t * basketEndX);
-      int py = (int)(u * u * basketStartY + 2.0f * u * t * basketCtrlY + t * t * basketEndY);
-      circle(px, py, 2, rgb565(255, 228, 150));
-    }
-    drawBasketBall((int)basketBallX, (int)basketBallY, max(5, (int)basketBallR));
-  }
-
-  if (basketResultReady) {
-    const char* result = basketShotMade ? "SWISH!" : "MISS";
-    uint16_t bg = basketShotMade ? rgb565(242, 174, 38) : rgb565(72, 78, 88);
-    roundBox(screenW / 2 - 78, 190, 156, 48, 8, bg);
-    textCenter(result, screenW / 2, 214, &fonts::Font4, C_WHITE, bg);
+  int statusY = screenH - 38;
+  // 进球(SWISH)显示时长跟随分数高亮：resultReady 期间 + 高亮 3s 期间都显示；
+  // 未进(MISS)显示时长与 SWISH 一致(独立计时，不影响用户继续投篮)。
+  bool highlight = basketScoreHighlightUntil != 0 && millis() < basketScoreHighlightUntil;
+  bool missShow = basketMissShowUntil != 0 && millis() < basketMissShowUntil;
+  if (!highlight && basketScoreHighlightUntil != 0) basketScoreHighlightUntil = 0;   // 过期清零
+  if (!missShow && basketMissShowUntil != 0) basketMissShowUntil = 0;                // 过期清零
+  bool swish = basketShotMade && (basketResultReady || highlight);
+  bool miss = !basketShotMade && (basketResultReady || missShow);
+  if (swish) {
+    textCenter("SWISH!", screenW / 2, statusY, &fonts::Font4, rgb565(242, 174, 38), bg);
+  } else if (miss) {
+    textCenter("MISS", screenW / 2, statusY, &fonts::Font4, rgb565(150, 160, 170), bg);
   } else if (!basketShotActive) {
     const char* hint = basketImuReady ? "Swing to shoot" : "Tap / A to shoot";
-    textCenter(hint, screenW / 2, 306, &fonts::Font2, C_WHITE, bg);
+    textCenter(hint, screenW / 2, statusY, &fonts::Font4, rgb565(51, 51, 51), bg);  // 20% 白(与黑底混合)
   }
 
   pushFrame();
@@ -2019,7 +924,7 @@ void drawBasketGame() {
 
 void drawBoot() {
   fillScreen(C_PITCH_1);
-  textCenter("STOPWATCH FOOTBALL", screenW / 2, screenH / 2 - 26, &fonts::Font4, C_WHITE, C_PITCH_1);
+  textCenter("STOPWATCH GAMES", screenW / 2, screenH / 2 - 26, &fonts::Font4, C_WHITE, C_PITCH_1);
   textCenter("Touch field to move", screenW / 2, screenH / 2 + 8, &fonts::Font2, C_WHITE, C_PITCH_1);
   textCenter("Closest player auto selected", screenW / 2, screenH / 2 + 34, &fonts::Font2, C_WHITE, C_PITCH_1);
   textCenter("A=PASS  B=SHOOT", screenW / 2, screenH / 2 + 60, &fonts::Font2, C_ACCENT, C_PITCH_1);
@@ -2027,6 +932,59 @@ void drawBoot() {
 }
 
 // ---- 菜单绘制 ----
+// 选车页：单辆轮播，中央大图
+void drawCarSelect() {
+  fillScreen(rgb565(20, 24, 32));
+  // 标题
+  textCenter("M RACING", screenW / 2, 70, &fonts::Font4, rgb565(0x3C, 0x3E, 0x46), rgb565(20, 24, 32));
+  // 画廊渲染：用浮点选中位置 carSelectPos 驱动所有车的位置和大小。
+  // 每辆车的屏幕 x = cx + (车索引 - carSelectPos) × 间距
+  // 大小按距中央的距离衰减：中央 160，每离一格减到 75%
+  int previewSize = 160;
+  int spacing = screenW * 45 / 100;   // 相邻车中心的间距
+  int cx = screenW / 2;
+  int cy = screenH / 2 + 10;
+  float pos = carSelectPos;   // 当前浮点位置(如 3.0 = 车3在中央)
+
+  // 先画车名(在底层)，再画车(覆盖在文字上)，让车辆遮挡文字底部
+  const char* carName = (carNameIndex >= 0 && carNameIndex <= 8) ? CAR_NAMES[carNameIndex] : "?";
+  // 车名真正透明：alpha 向背景色(深灰 #14181C)混合，alpha=0 完全融入背景不可见
+  // 背景色 rgb565(20,24,28)，文字色 rgb565(153,153,153)
+  if (carNameAlpha < 0.02f) {
+    // alpha≈0：完全不画(真正透明，不可见)
+  } else {
+    int bgR = 20, bgG = 24, bgB = 28;     // 背景色
+    int fgR = 153, fgG = 153, fgB = 153;  // 文字色(60%白)
+    int r = bgR + (int)((fgR - bgR) * carNameAlpha);
+    int g = bgG + (int)((fgG - bgG) * carNameAlpha);
+    int b = bgB + (int)((fgB - bgB) * carNameAlpha);
+    gfxTextCenterBold(carName, cx, cy - previewSize / 2 + 20, 2, rgb565(r, g, b), rgb565(20, 24, 32));
+  }
+
+  // 统一只画 3 辆，动画中用 fast 模式(最近邻，无 pushImage)
+  bool isAnimating = (carSelectAnimT < 1.0f) || carSelectDragging;
+  for (int i = -1; i <= 1; ++i) {
+    int carIdx = (int)roundf(pos) + i;
+    if (carIdx < 0 || carIdx > 8) continue;
+    float relPos = (float)carIdx - pos;
+    int x = cx + (int)(relPos * spacing);
+    float dist = fabsf(relPos);
+    int size = (int)(previewSize * (1.0f - 0.25f * dist));
+    if (size < 50) continue;
+    drawCarPreview(carIdx, x, cy, size, isAnimating);
+  }
+  // GO 按钮(车型下方)：大圆角描边 2px，黄色文字居中，上移 20px
+  int goW = 160, goH = 60;   // 宽度 180→160 (两边各缩 10)
+  int goX = cx - goW / 2;
+  int goY = cy + previewSize / 2 + 30;   // 原 50 → 30，上移 20px
+  // 全圆角(胶囊形)描边：外框黄 + 内框背景色，形成 2px 圆角描边
+  uint16_t bgC = rgb565(20, 24, 32);
+  roundBox(goX, goY, goW, goH, 100, C_YELLOW);          // 外框(黄，圆角自动钳制到 goH/2)
+  roundBox(goX + 2, goY + 2, goW - 4, goH - 4, 100, bgC); // 内框(背景色，留 2px 黄边)
+  textCenter("GO", cx, goY + goH / 2 + 2, &fonts::Font4, C_YELLOW, bgC);
+  pushFrame();
+}
+
 void drawMenu() {
   fillScreen(rgb565(20, 24, 32));
   // 标题
@@ -2045,14 +1003,11 @@ void drawMenu() {
     uint16_t edge = sel ? C_ACCENT : C_DIM;
     roundBox(cx, cardY, cardW, cardH, 8, bg);
     rectLine(cx, cardY, cardW, cardH, edge);
-    const char* name = (i == 0) ? "FOOTBALL" : (i == 1 ? "RACING" : "AIR SHOT");
-    textCenter(name, cx + cardW / 2, cardY + cardH / 2 - 6, (i == 2 ? &fonts::Font2 : &fonts::Font4),
+    const char* name = (i == 0) ? "RACING" : "AIR SHOT";
+    textCenter(name, cx + cardW / 2, cardY + cardH / 2 + 14, &fonts::Font4,   // 标题下移 20px(原 -6)
                sel ? C_WHITE : C_DIM, bg);
     // 简易图标提示
     if (i == 0) {
-      circle(cx + cardW / 2, cardY + 50, 18, C_WHITE);
-      circle(cx + cardW / 2, cardY + 50, 5, C_BLACK);
-    } else if (i == 1) {
       roundBox(cx + cardW / 2 - 22, cardY + 36, 44, 28, 4, C_RED);
       box(cx + cardW / 2 - 16, cardY + 42, 32, 10, C_BLACK);
     } else {
@@ -2071,7 +1026,7 @@ void setup() {
   auto cfg = M5.config();
   cfg.fallback_board = m5::board_t::board_M5StopWatch;
   cfg.serial_baudrate = 115200;
-  cfg.internal_spk = false;
+  cfg.internal_spk = true;
   cfg.internal_mic = false;
   cfg.internal_imu = true;
   cfg.internal_rtc = false;
@@ -2086,34 +1041,27 @@ void setup() {
   M5.Display.setBrightness(190);
   M5.Display.setColorDepth(16);
   M5.Display.fillScreen(C_BLACK);
+
+  auto spkCfg = M5.Speaker.config();
+  spkCfg.magnification = 24;
+  M5.Speaker.config(spkCfg);
+  speakerReady = M5.Speaker.begin();
+  if (speakerReady) M5.Speaker.setVolume(255);
   canvas.setColorDepth(16);
   useCanvas = canvas.createSprite(screenW, screenH) != nullptr;
   if (!useCanvas) M5.Display.fillScreen(C_BLACK);
 
-  fieldLeft = 0;
-  fieldTop = 0;
-  fieldRight = fieldLeft + (screenW * FIELD_SCALE_NUM) / FIELD_SCALE_DEN;
-  fieldBottom = fieldTop + (screenH * FIELD_SCALE_NUM) / FIELD_SCALE_DEN;
-  goalLeft = (fieldLeft + fieldRight) / 2 - 84;
-  goalRight = (fieldLeft + fieldRight) / 2 + 84;
-  cameraX = 0.0f;
-  cameraY = 0.0f;
+
 
   initRawButtons();
   drawBoot();
-  resetKickoff(true);
-  matchPhase = PH_FIRST_HALF;
-  realSecond = 0;
-  displaySecond = 0;
-  playerScore = 0;
-  cpuScore = 0;
   lastTickMs = millis();
-  startMatchClock();
   gameMode = MODE_MENU;   // 开机进菜单选择游戏
 
-  Serial.printf("[Boot] display=%dx%d canvas=%s touch=%s keyA_idle=%d keyB_idle=%d\n",
+  Serial.printf("[Boot] display=%dx%d canvas=%s touch=%s speaker=%s keyA_idle=%d keyB_idle=%d\n",
                 screenW, screenH, useCanvas ? "ok" : "off",
                 M5.Touch.isEnabled() ? "ok" : "off",
+                speakerReady ? "ok" : "off",
                 rawA.idleLevel, rawB.idleLevel);
 }
 
@@ -2124,40 +1072,172 @@ void loop() {
 
   bool passPressed = rawA.pressed || M5.BtnA.wasPressed();
   bool shootPressed = rawB.pressed || M5.BtnB.wasPressed();
+  // A+B 同时按住 → 返回菜单(任何游戏状态下)
+  if (gameMode != MODE_MENU && M5.BtnA.isPressed() && M5.BtnB.isPressed()) {
+    gameMode = MODE_MENU;
+    passPressed = false;
+    shootPressed = false;
+  }
 
   uint32_t now = millis();
   float dt = (now - lastTickMs) / 1000.0f;
   lastTickMs = now;
   dt = clampf(dt, 0.0f, 0.040f);
 
+  // 选车场景背景音乐：进入播放、离开停止(集中守卫，覆盖所有切换路径)
+  static GameMode prevGameMode = MODE_MENU;
+  if (prevGameMode != MODE_CAR_SELECT && gameMode == MODE_CAR_SELECT) startCarSelectBgm();
+  else if (prevGameMode == MODE_CAR_SELECT && gameMode != MODE_CAR_SELECT) stopCarSelectBgm();
+  prevGameMode = gameMode;
+
   if (gameMode == MODE_MENU) {
-    // 菜单：触摸左/右选游戏，A 确认
+    // 菜单：触摸点选(点哪个卡片进哪个游戏)，A 确认当前选中
+    bool touchTapped = false;
+    int tapIdx = -1;
     if (M5.Touch.isEnabled() && M5.Touch.getCount() > 0) {
       auto& pt = M5.Touch.getTouchPointRaw(0);
       Vec2 tp = touchToScreen(pt.x, pt.y);
+      // 触摸滑动选择(跟随 x 位置)
       menuSelected = clampf(tp.x / (screenW / (float)GAME_COUNT), 0.0f, (float)(GAME_COUNT - 1));
+      // 判断触摸点是否落在某个卡片范围内 → 点击进入
+      const int cardW = 134, cardH = 186, gap = 14;
+      int totalW = cardW * GAME_COUNT + gap * (GAME_COUNT - 1);
+      int startX = (screenW - totalW) / 2;
+      int cardY = 142;
+      for (int i = 0; i < GAME_COUNT; ++i) {
+        int cx = startX + i * (cardW + gap);
+        if (tp.x >= cx && tp.x < cx + cardW && tp.y >= cardY && tp.y < cardY + cardH) {
+          tapIdx = i;
+          menuSelected = i;   // 同时选中该卡片
+          break;
+        }
+      }
     }
+    bool enterGame = passPressed;   // A 键进入
     if (shootPressed) menuSelected = (menuSelected + 1) % GAME_COUNT;  // B 切换
-    if (passPressed) {
-      if (menuSelected == 0) {
-        // 进足球
-        resetKickoff(true);
-        matchPhase = PH_FIRST_HALF;
-        realSecond = 0; displaySecond = 0;
-        playerScore = 0; cpuScore = 0;
-        startMatchClock();
-        gameMode = MODE_FOOTBALL;
-      } else if (menuSelected == 1) {
-        // 进赛车
-        racingInit();
-        gameMode = MODE_RACING;
-      } else {
+    // 触摸点击卡片也进入(用 tapIdx 触发，需配合点击判定)
+    // 简化：触摸点在卡片内时直接进入，避免复杂 tap 检测
+    if (tapIdx >= 0) enterGame = true;
+    if (enterGame) {
+      int sel = (int)menuSelected;
+      if (sel == 0) {
+        // 进赛车：先选车
+        carSelectIndex = 0;
+        carSelectConfirmed = false;
+        carSelectTouchPrev = true;   // 标记当前正在触摸，避免立刻触发
+        carSelectSwipeStartX = -1;   // 无效起点，必须真正按下(touchJustPressed)才生效
+        carSelectSwipeStartY = -1;
+        carSelectLastX = -1;
+        carSelectSwipeUsed = false;
+        carSelectPos = 0.0f;   // 从车 0 开始
+        carNameIndex = 0;
+        gameMode = MODE_CAR_SELECT;
+      } else if (sel == 1) {
         // 进空气投篮
         basketInit();
         gameMode = MODE_BASKETBALL;
       }
     }
     drawMenu();
+    delay(16);
+    return;
+  }
+
+  if (gameMode == MODE_CAR_SELECT) {
+    // 选车页：跟手滑动 + 松手吸附，点击 GO/A 进入游戏
+    bool touchActive = (M5.Touch.isEnabled() && M5.Touch.getCount() > 0);
+    bool touchJustPressed = touchActive && !carSelectTouchPrev;
+    bool touchJustReleased = !touchActive && carSelectTouchPrev;
+    carSelectTouchPrev = touchActive;
+
+    // 按下：记录起点
+    if (touchJustPressed) {
+      auto& pt = M5.Touch.getTouchPointRaw(0);
+      Vec2 tp = touchToScreen(pt.x, pt.y);
+      carSelectSwipeStartX = tp.x;
+      carSelectSwipeStartY = tp.y;
+      carSelectLastX = tp.x;
+      carSelectDragging = true;
+      carSelectSwipeUsed = false;   // 重置：本次手势还没切换
+    }
+
+    // 拖动中：超过阈值立即切换(不等松手)，一次手势只切一辆
+    if (touchActive && carSelectDragging) {
+      auto& pt = M5.Touch.getTouchPointRaw(0);
+      Vec2 tp = touchToScreen(pt.x, pt.y);
+      carSelectLastX = tp.x;
+      if (!carSelectSwipeUsed) {
+        int dx = tp.x - carSelectSwipeStartX;
+        if (dx > 30 && carSelectIndex > 0) {
+          // 右滑→上一辆，立即启动动画
+          carSelectAnimFrom = carSelectPos;
+          carSelectAnimT = 0.0f;
+          carNameFading = true;   // 启动车名渐隐
+          carSelectIndex--;
+          carSelectSwipeUsed = true;   // 锁定，本次手势不再切
+        } else if (dx < -30 && carSelectIndex < 8) {
+          // 左滑→下一辆，立即启动动画
+          carSelectAnimFrom = carSelectPos;
+          carSelectAnimT = 0.0f;
+          carNameFading = true;   // 启动车名渐隐
+          carSelectIndex++;
+          carSelectSwipeUsed = true;
+        }
+      }
+    }
+
+    // 松开：只判断短按(GO 按钮)
+    if (touchJustReleased && carSelectDragging) {
+      carSelectDragging = false;
+      int totalDx = carSelectLastX - carSelectSwipeStartX;
+      if (abs(totalDx) < 25) {
+        // 短按：检查 GO 按钮
+        int goW = 160, goH = 60;
+        int goX = screenW / 2 - goW / 2;
+        int goY = screenH / 2 + 10 + 160 / 2 + 30;
+        if (carSelectSwipeStartX >= goX && carSelectSwipeStartX < goX + goW &&
+            carSelectSwipeStartY >= goY && carSelectSwipeStartY < goY + goH) {
+          racingSetPlayerCarType(carSelectIndex);
+          racingInit();
+          gameMode = MODE_RACING;
+        }
+      }
+    }
+
+    // 非拖动时：线性插值动画(匀速滑动，比指数衰减更流畅均匀)
+    if (!carSelectDragging) {
+      // carSelectAnimFrom 记录动画起点，carSelectAnimT 从 0→1
+      if (carSelectAnimT < 1.0f) {
+        carSelectAnimT += dt * 6.0f;   // 约 0.17 秒完成
+        if (carSelectAnimT > 1.0f) carSelectAnimT = 1.0f;
+        // ease-out 曲线(开始快结尾缓，比纯线性更自然)
+        float e = 1.0f - (1.0f - carSelectAnimT) * (1.0f - carSelectAnimT);
+        carSelectPos = carSelectAnimFrom + (carSelectIndex - carSelectAnimFrom) * e;
+        // 车名渐隐：整个动画期间 alpha 从 1→0
+        if (carNameFading) {
+          carNameAlpha = max(0.0f, 1.0f - carSelectAnimT);
+        }
+      } else {
+        carSelectPos = (float)carSelectIndex;
+        carNameIndex = carSelectIndex;   // 动画结束，车名更新
+        carNameFading = false;   // 停止渐隐
+      }
+      // 非渐隐时：alpha 渐显回 1(慢速，更明显)
+      if (!carNameFading && carNameAlpha < 1.0f) {
+        carNameAlpha += dt * 2.5f;
+        if (carNameAlpha > 1.0f) carNameAlpha = 1.0f;
+      }
+    }
+
+    carSelectTransT = 1.0f;
+
+    // A 键：直接开始赛车
+    if (passPressed) {
+      racingSetPlayerCarType(carSelectIndex);
+      racingInit();
+      gameMode = MODE_RACING;
+    }
+    drawCarSelect();
     delay(16);
     return;
   }
@@ -2173,12 +1253,16 @@ void loop() {
     if (racingIsGameOver()) {
       if (passPressed) racingRestartFromExternal();
       else if (shootPressed) { gameMode = MODE_MENU; }
+    } else if (racingIsIntroActive()) {
+      // 入场动画期间：只更新不处理输入，避免从选车页带入手势误触
+      racingUpdate(dt);
     } else {
       racingHandleInput(passPressed, shootPressed, steerX);
       racingUpdate(dt);
     }
     racingDraw();
-    delay(16);
+    uint32_t frameElapsed = millis() - now;
+    delay(frameElapsed < 16 ? 16 - frameElapsed : 1);
     return;
   }
 
@@ -2194,19 +1278,5 @@ void loop() {
     delay(16);
     return;
   }
-
-  // ---- 足球游戏（原逻辑）----
-  // 中场/终场：等待任意键继续
-  if (matchPhase == PH_HALFTIME) {
-    if (passPressed || shootPressed) startSecondHalf();
-  } else if (matchPhase == PH_FULLTIME) {
-    if (passPressed || shootPressed) restartMatch();
-  } else if (!celebrateActive) {
-    if (passPressed) makePass();
-    if (shootPressed && !kickoffPending) shootBall();
-  }
-
-  updateGame(dt);
-  drawGame();
   delay(16);
 }
