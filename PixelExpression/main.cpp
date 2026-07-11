@@ -1088,6 +1088,8 @@ void loop() {
   static GameMode prevGameMode = MODE_MENU;
   if (prevGameMode != MODE_CAR_SELECT && gameMode == MODE_CAR_SELECT) startCarSelectBgm();
   else if (prevGameMode == MODE_CAR_SELECT && gameMode != MODE_CAR_SELECT) stopCarSelectBgm();
+  // 无论通过 A+B、Game Over 返回还是其它路径离开赛车，都统一停止循环车声并清理震动。
+  if (prevGameMode == MODE_RACING && gameMode != MODE_RACING) racingRequestExit();
   prevGameMode = gameMode;
 
   if (gameMode == MODE_MENU) {

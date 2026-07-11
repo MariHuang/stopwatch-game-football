@@ -4,6 +4,8 @@
 #include "racing_car_preview.h"   // 选车页高清预览
 #include "racing_coin_sprite.h"
 #include "racing_under_tunnel_sprite.h"
+#include "coin_sound.h"
+#include "racing_bgm_sound.h"
 #include <M5Unified.h>
 #include <math.h>
 #include <pgmspace.h>
@@ -173,6 +175,7 @@ static int   rSceneFrom  = 0;        // 场景过渡起点
 static float rSceneTransT = 1.0f;    // 切场景后的颜色/道路过渡进度(1s)
 static float rDecorRevealT = 1.0f;   // 装饰层(高楼/高山/大海)升起进度(1.5s，海底隧道 1s)
 static int   rDecorYOffset = 0;      // 切场景时装饰层从赛道背后向上升起
+static float rCloudFade = 1.0f;      // 云朵渐显进度：装饰层升起完成后 0→1(约1s)
 static float rTimeOfDay  = 0.0f;     // 城市日夜过渡值：0=日间 1=夜间
 static bool  rGameOver   = false;
 static bool  rRearCrashPending = false; // 追尾后先震动，震动结束再进入 Game Over
@@ -180,6 +183,11 @@ static uint32_t rRearCrashUntil = 0;
 static constexpr uint32_t REAR_CRASH_VIBRATION_MS = 400;
 static uint32_t rCoinVibrationUntil = 0;
 static constexpr uint32_t COIN_VIBRATION_MS = 70;
+static constexpr uint8_t COIN_SOUND_VOLUME = 120;
+static uint8_t rNextCoinSoundChannel = 3; // 通道 3..7 轮流使用，允许连续金币音效重叠
+static bool rRacingBgmPlaying = false;
+static constexpr int RACING_BGM_CHANNEL = 2; // 与选车 BGM 的通道 1 分离
+static constexpr uint8_t RACING_BGM_VOLUME = 160;
 static bool  rExitFlag   = false;
 static bool  rOffTrack   = false;       // 是否冲出赛道
 static uint32_t rOffTrackUntil = 0;     // 冲出赛道后 Game Over 倒计时
@@ -215,6 +223,8 @@ static void fillQuad(int x0, int y0, int x1, int y1, int x2, int y2, int x3, int
 static void fillQuadAlpha(int x0, int y0, int x1, int y1, int x2, int y2, int x3, int y3, uint16_t color, float alpha);
 static uint16_t blendPixelLight(uint16_t bgC, uint16_t lightC, float alpha);
 static void drawHeadlights(int cx, int baseY, int carW, int carH, float depth, bool player, float lane);
+static void startRacingBgm();
+static void stopRacingBgm();
 
 static void updateSceneState(float dt) {
   int nextScene = (rCoinScore / SCENE_COIN_INTERVAL) % 6;
@@ -223,6 +233,7 @@ static void updateSceneState(float dt) {
     rSceneIdx = nextScene;
     rSceneTransT = 0.0f;
     rDecorRevealT = 0.0f;
+    rCloudFade = 0.0f;   // 切场景时云朵重置为不可见，等装饰层升起后再渐显
     if (rSceneIdx == 3) {
       rNextNightMeteorMs = millis() + NIGHT_METEOR_INTERVAL_MS;
     } else {
@@ -239,6 +250,11 @@ static void updateSceneState(float dt) {
     float revealSpeed = (rSceneIdx == 2) ? 1.0f : (1.0f / 1.5f);
     rDecorRevealT += dt * revealSpeed;
     if (rDecorRevealT > 1.0f) rDecorRevealT = 1.0f;
+  }
+  // 云朵渐显：装饰层升起完成后才开始，约 1 秒淡入到完全可见
+  if (rDecorRevealT >= 1.0f && rCloudFade < 1.0f) {
+    rCloudFade += dt;
+    if (rCloudFade > 1.0f) rCloudFade = 1.0f;
   }
 
   float targetTod = (rSceneIdx == 3) ? 1.0f : 0.0f;
@@ -331,6 +347,7 @@ void racingInit() {
   rSceneFrom = 0;
   rSceneTransT = 0.0f;   // 开场也有从下往上升起的动画
   rDecorRevealT = 0.0f;
+  rCloudFade = 0.0f;     // 开场云朵也从升起后渐显
   rTimeOfDay = 0.0f;
   rMeteor.active = false;
   rGameOver = false;
@@ -342,6 +359,7 @@ void racingInit() {
   rOffTrackUntil = 0;
   for (int i = 0; i < OBSTACLE_MAX; ++i) obstacles[i].active = false;
   for (int i = 0; i < COIN_POP_MAX; ++i) coinPops[i].active = false;
+  startRacingBgm();
 }
 
 // ---- 障碍生成 ----
@@ -518,8 +536,22 @@ static void startMeteor() {
   rMeteor.endY = y1;
 }
 
+static void startRacingBgm() {
+  if (rRacingBgmPlaying) return;
+  M5.Speaker.setChannelVolume(RACING_BGM_CHANNEL, RACING_BGM_VOLUME);
+  rRacingBgmPlaying = M5.Speaker.playRaw(
+      RACING_BGM_DATA, RACING_BGM_LEN, RACING_BGM_SAMPLE_RATE,
+      false, 0, RACING_BGM_CHANNEL, true);
+}
+
+static void stopRacingBgm() {
+  M5.Speaker.stop(RACING_BGM_CHANNEL);
+  rRacingBgmPlaying = false;
+}
+
 static void startRearCrash() {
   if (rRearCrashPending || rGameOver) return;
+  stopRacingBgm();
   rRearCrashPending = true;
   rRearCrashUntil = millis() + REAR_CRASH_VIBRATION_MS;
   rCoinVibrationUntil = 0;
@@ -531,6 +563,12 @@ static void startCoinVibration() {
   if (rRearCrashPending || rGameOver) return;
   rCoinVibrationUntil = millis() + COIN_VIBRATION_MS;
   M5.Power.setVibration(110);
+  int soundChannel = rNextCoinSoundChannel;
+  rNextCoinSoundChannel = (rNextCoinSoundChannel >= 7) ? 3 : (rNextCoinSoundChannel + 1);
+  M5.Speaker.setChannelVolume(soundChannel, COIN_SOUND_VOLUME);
+  // 在 5 个独立通道间轮换，降低音量的同时保留连续金币的重叠播放能力。
+  M5.Speaker.playRaw(COIN_SOUND_DATA, COIN_SOUND_LEN, COIN_SOUND_SAMPLE_RATE,
+                     false, 1, soundChannel, true);
 }
 
 // ---- 输入 ----
@@ -652,6 +690,7 @@ void racingUpdate(float dt) {
     if (oldZ > 0.5f && obstacles[i].z < 0.0f) {
       float laneDiff = fabsf(obstacles[i].lane - rCarX);
       if (laneDiff < 0.5f) {
+        stopRacingBgm();
         rGameOver = true;
         if (rCoinScore > (int)rHighScore) rHighScore = (float)rCoinScore;
       }
@@ -724,6 +763,7 @@ bool racingWantsExit()  { return rExitFlag; }
 
 // 重开（外部按键触发）
 static void racingRestart() {
+  stopRacingBgm();
   M5.Power.setVibration(0);
   rSpeed = 0.6f;   // 起始即 60km/h
   rStartMs = millis();   // 记录开始时刻，用于分阶段自动提速
@@ -754,6 +794,7 @@ static void racingRestart() {
   rSceneFrom = 0;
   rSceneTransT = 0.0f;   // 开场也有从下往上升起的动画
   rDecorRevealT = 0.0f;
+  rCloudFade = 0.0f;     // 开场云朵也从升起后渐显
   rTimeOfDay = 0.0f;
   rMeteor.active = false;
   rGameOver = false;
@@ -765,6 +806,7 @@ static void racingRestart() {
   rOffTrackUntil = 0;
   for (int i = 0; i < OBSTACLE_MAX; ++i) obstacles[i].active = false;
   for (int i = 0; i < COIN_POP_MAX; ++i) coinPops[i].active = false;
+  startRacingBgm();
 }
 
 // 入场动画是否进行中
@@ -774,6 +816,7 @@ bool racingIsIntroActive() {
 
 // 外部调用：设置退出标志(返回菜单)
 void racingRequestExit() {
+  stopRacingBgm();
   M5.Power.setVibration(0);
   rRearCrashPending = false;
   rRearCrashUntil = 0;
@@ -784,77 +827,45 @@ void racingRequestExit() {
 void racingRestartFromExternal() { racingRestart(); }
 
 // 画一朵云（平滑椭圆组合）
-static void drawCloud(int cx, int cy, int scale, int variant = 0) {
-  // 4 种不同形态的云，scale 控制大小
+static void drawCloud(int cx, int cy, int scale, int variant = 0, uint16_t cloudC = R_CLOUD) {
+  // 6 种不同形态的云，scale 控制大小，cloudC 控制颜色(用于渐显)
   switch (variant) {
     case 0:  // 蓬松大云：中间大圆 + 两侧小圆 + 顶部
-      gfxEllipse(cx, cy, scale * 2, scale, R_CLOUD);
-      gfxEllipse(cx - scale, cy - scale / 3, scale, scale * 2 / 3, R_CLOUD);
-      gfxEllipse(cx + scale, cy - scale / 3, scale, scale * 2 / 3, R_CLOUD);
-      gfxEllipse(cx, cy - scale / 2, scale * 3 / 4, scale * 2 / 3, R_CLOUD);
+      gfxEllipse(cx, cy, scale * 2, scale, cloudC);
+      gfxEllipse(cx - scale, cy - scale / 3, scale, scale * 2 / 3, cloudC);
+      gfxEllipse(cx + scale, cy - scale / 3, scale, scale * 2 / 3, cloudC);
+      gfxEllipse(cx, cy - scale / 2, scale * 3 / 4, scale * 2 / 3, cloudC);
       break;
     case 1:  // 长条云：横向延伸多个圆
-      gfxEllipse(cx - scale, cy, scale * 3 / 2, scale * 2 / 3, R_CLOUD);
-      gfxEllipse(cx + scale, cy, scale * 3 / 2, scale * 2 / 3, R_CLOUD);
-      gfxEllipse(cx, cy, scale, scale * 2 / 3, R_CLOUD);
-      gfxEllipse(cx, cy - scale / 3, scale * 2 / 3, scale / 2, R_CLOUD);
+      gfxEllipse(cx - scale, cy, scale * 3 / 2, scale * 2 / 3, cloudC);
+      gfxEllipse(cx + scale, cy, scale * 3 / 2, scale * 2 / 3, cloudC);
+      gfxEllipse(cx, cy, scale, scale * 2 / 3, cloudC);
+      gfxEllipse(cx, cy - scale / 3, scale * 2 / 3, scale / 2, cloudC);
       break;
     case 2:  // 小团云：紧凑的 2-3 个圆
-      gfxEllipse(cx, cy, scale, scale * 2 / 3, R_CLOUD);
-      gfxEllipse(cx + scale * 2 / 3, cy + scale / 4, scale * 3 / 4, scale / 2, R_CLOUD);
-      gfxEllipse(cx - scale * 2 / 3, cy + scale / 4, scale * 3 / 4, scale / 2, R_CLOUD);
+      gfxEllipse(cx, cy, scale, scale * 2 / 3, cloudC);
+      gfxEllipse(cx + scale * 2 / 3, cy + scale / 4, scale * 3 / 4, scale / 2, cloudC);
+      gfxEllipse(cx - scale * 2 / 3, cy + scale / 4, scale * 3 / 4, scale / 2, cloudC);
       break;
     case 3:  // 高耸云：底部宽顶部尖
-      gfxEllipse(cx, cy, scale * 3 / 2, scale * 2 / 3, R_CLOUD);
-      gfxEllipse(cx, cy - scale / 2, scale, scale * 3 / 4, R_CLOUD);
-      gfxEllipse(cx, cy - scale, scale * 2 / 3, scale / 2, R_CLOUD);
-      gfxEllipse(cx - scale, cy, scale * 3 / 4, scale / 2, R_CLOUD);
-      gfxEllipse(cx + scale, cy, scale * 3 / 4, scale / 2, R_CLOUD);
+      gfxEllipse(cx, cy, scale * 3 / 2, scale * 2 / 3, cloudC);
+      gfxEllipse(cx, cy - scale / 2, scale, scale * 3 / 4, cloudC);
+      gfxEllipse(cx, cy - scale, scale * 2 / 3, scale / 2, cloudC);
+      gfxEllipse(cx - scale, cy, scale * 3 / 4, scale / 2, cloudC);
+      gfxEllipse(cx + scale, cy, scale * 3 / 4, scale / 2, cloudC);
+      break;
+    case 4:  // 卷云：细长丝带状(高空稀薄云)
+      gfxEllipse(cx, cy, scale * 2, scale * 2 / 5, cloudC);
+      gfxEllipse(cx - scale / 2, cy - scale / 4, scale, scale / 3, cloudC);
+      gfxEllipse(cx + scale, cy + scale / 5, scale * 3 / 4, scale / 4, cloudC);
+      break;
+    case 5:  // 双层堆叠云：上下两团错开(厚重积云)
+      gfxEllipse(cx, cy + scale / 3, scale * 3 / 2, scale * 4 / 5, cloudC);
+      gfxEllipse(cx - scale / 2, cy - scale / 4, scale, scale * 2 / 3, cloudC);
+      gfxEllipse(cx + scale * 3 / 4, cy, scale * 5 / 6, scale / 2, cloudC);
+      gfxEllipse(cx, cy - scale * 2 / 3, scale * 3 / 4, scale / 2, cloudC);
       break;
   }
-}
-
-static void drawDayAirplane(int horizonY) {
-  // 飞机从屏幕左下外(近处、巨大)斜向飞向右上方远端消失点，由大缩到无
-  const uint32_t cycleMs = 14000;
-  const uint32_t flightMs = 8000;
-  uint32_t elapsed = (millis() - rStartMs) % cycleMs;
-  if (elapsed >= flightMs) return;
-
-  float t = (float)elapsed / flightMs;
-  // ease-out：近处移动/缩小快，远处变慢，符合远处角速度小的透视
-  float e = 1.0f - (1.0f - t) * (1.0f - t);
-  // scale 从 2.4(近处、巨大) 缩到 0.0(远端完全消失)
-  float s = 2.4f * (1.0f - e);
-  if (s <= 0.05f) return;  // 已缩到看不见
-
-  // 轨迹：左下屏幕外 → 右上远端消失点(地平线方向)
-  int startX = -90;                // 屏幕左外(保证大尺寸时整体在屏外飞入)
-  int endX = rSW / 2 + 30;         // 远端消失点(略偏右上)
-  int x = startX + (int)((endX - startX) * e);
-  int nearY = horizonY + 40;       // 近处极低(地平线下方，离观众最近)
-  int farY = max(30, horizonY / 3);// 远处高空
-  int y = nearY + (int)((farY - nearY) * e);
-  y += (int)(sinf(t * 6.2831853f) * 2.0f * s);  // 上下浮动随 scale 衰减
-
-  uint16_t trailC = RRGB565(220, 230, 232);
-  uint16_t bodyC = RRGB565(246, 248, 244);
-  uint16_t shadeC = RRGB565(176, 194, 204);
-  uint16_t accentC = RRGB565(224, 68, 58);
-
-  // 所有偏移乘 s 实现整体缩放；下限保护避免退化图元
-  int w5 = max(1, (int)(5 * s));
-  int e3 = max(1, (int)(3 * s));
-  int e2 = max(1, (int)(2 * s));
-
-  gfxLine(x - (int)(42 * s), y + (int)(1 * s), x - (int)(22 * s), y, trailC);
-  gfxLine(x - (int)(38 * s), y + (int)(4 * s), x - (int)(20 * s), y + (int)(2 * s), trailC);
-  gfxWideLine(x - (int)(15 * s), y, x + (int)(15 * s), y - (int)(1 * s), w5, bodyC);
-  gfxEllipse(x + (int)(15 * s), y - (int)(1 * s), e3, e2, bodyC);
-  gfxFillTriangle(x - (int)(3 * s), y, x - (int)(12 * s), y + (int)(11 * s), x + (int)(7 * s), y, shadeC);
-  gfxFillTriangle(x - (int)(1 * s), y - (int)(2 * s), x - (int)(9 * s), y - (int)(10 * s), x + (int)(6 * s), y - (int)(1 * s), bodyC);
-  gfxFillTriangle(x - (int)(13 * s), y, x - (int)(18 * s), y - (int)(7 * s), x - (int)(8 * s), y, accentC);
-  gfxPixel(x + (int)(9 * s), y - (int)(2 * s), RRGB565(54, 104, 144));
 }
 
 // 画一棵树（圆形树冠 + 圆柱树干，平滑风格）
@@ -932,18 +943,22 @@ static void drawMeteor() {
   gfxPixel(headX, headY - 1, cHead);
 }
 
-static void drawBuilding(int x, int baseY, int w, int h, int side, int seed) {
+static void drawBuilding(int x, int baseY, int w, int h, int side, int seed, float night) {
   if (w < 4 || h < 6) return;
-  int depth = max(2, w / 4);
+  int depth = max(2, w / 7);
   int topY = baseY - h;
-  uint16_t face = buildingColor(seed, 0);
-  uint16_t lit = buildingColor(seed, 20);
-  uint16_t dark = buildingColor(seed, -32);
-  uint16_t edge = buildingColor(seed, -48);
-  uint16_t roof = buildingColor(seed, -42);
-  uint16_t roofHi = buildingColor(seed, -18);
-  uint16_t win = RRGB565(210, 236, 248);           // 窗户：白天蓝天反光
-  uint16_t winDim = RRGB565(118, 142, 156);        // 暗窗
+  uint16_t nightFace = RRGB565(26 + (seed % 3) * 5, 24 + (seed % 4) * 3, 52 + (seed % 2) * 10);
+  uint16_t face = rLerpColor(buildingColor(seed, 0), nightFace, night);
+  uint16_t lit = rLerpColor(buildingColor(seed, 20), RRGB565(50, 44, 78), night);
+  uint16_t dark = rLerpColor(buildingColor(seed, -32), RRGB565(13, 15, 34), night);
+  uint16_t edge = rLerpColor(buildingColor(seed, -48), RRGB565(10, 11, 28), night);
+  uint16_t roof = rLerpColor(buildingColor(seed, -42), RRGB565(18, 18, 42), night);
+  uint16_t roofHi = rLerpColor(buildingColor(seed, -18), RRGB565(62, 52, 88), night);
+  uint16_t dayWin = RRGB565(202, 232, 248);        // 日间玻璃反光
+  uint16_t dayWinDim = RRGB565(112, 150, 174);
+  uint16_t nightWinWarm = RRGB565(255, 222, 126);  // 夜间室内暖光
+  uint16_t nightWinCool = RRGB565(154, 202, 238);  // 少量冷色灯光
+  uint16_t nightWinOff = RRGB565(13, 18, 36);
 
   int frontX = x;
   int sideX = x + side * depth;   // 侧面后边缘 x(右边楼在右，左边楼在左)
@@ -951,7 +966,8 @@ static void drawBuilding(int x, int baseY, int w, int h, int side, int seed) {
   if (side < 0) frontX = x - w;   // 左边楼：正面在 x-w..x
 
   // 投影/底座，让近处楼和地面贴合。
-  gfxBox(frontX - (side < 0 ? depth : 0), baseY - 2, faceW + depth, max(2, h / 18), RRGB565(70, 76, 78));
+  uint16_t baseC = rLerpColor(RRGB565(70, 76, 78), RRGB565(13, 14, 28), night);
+  gfxBox(frontX - (side < 0 ? depth : 0), baseY - 2, faceW + depth, max(2, h / 18), baseC);
   gfxBox(frontX, topY, faceW, h, face);
   gfxBox(frontX, topY, faceW, 2, roofHi);
   gfxBox(frontX, topY, 2, h, lit);
@@ -975,37 +991,50 @@ static void drawBuilding(int x, int baseY, int w, int h, int side, int seed) {
     gfxFillTriangle(frontX + faceW, topY, leftSideX, topY + depth, frontX, topY + depth / 2, roof);
   }
 
-  // 楼顶小结构，制造高矮错落的轮廓。
-  if (h > 34 && cityRand(seed, 3, 3) != 0) {
-    int pentW = max(4, w / 4);
-    int pentH = max(3, h / 12);
-    int pentX = frontX + cityRand(seed, 4, max(1, faceW - pentW));
-    gfxBox(pentX, topY - pentH, pentW, pentH, roof);
-    gfxBox(pentX, topY - pentH, pentW, 1, roofHi);
-  }
-  if (h > 58 && cityRand(seed, 5, 4) == 0) {
-    int antX = frontX + faceW / 2 + cityRand(seed, 6, max(1, faceW / 3)) - faceW / 6;
-    gfxLine(antX, topY - max(10, h / 10), antX, topY, edge);
+  // 简洁楼冠：只保留一栋地标尖塔，其余使用平顶或单层阶梯顶。
+  if (h > 68) {
+    int centerX = frontX + faceW / 2;
+    if (seed == 4) {
+      int crownW = max(8, faceW / 3);
+      int crownH = max(7, h / 18);
+      gfxBox(centerX - crownW / 2, topY - crownH, crownW, crownH, roof);
+      gfxBox(centerX - crownW / 2, topY - crownH, crownW, 1, roofHi);
+      int spireTop = topY - crownH - max(18, h / 8);
+      gfxLine(centerX, spireTop, centerX, topY - crownH, roofHi);
+      if (night > 0.5f) gfxPixel(centerX, spireTop, RRGB565(242, 68, 76));
+    } else if ((seed % 3) == 1) {
+      int pentW = max(9, faceW / 2);
+      int pentH = max(5, h / 24);
+      gfxBox(centerX - pentW / 2, topY - pentH, pentW, pentH, roof);
+      gfxBox(centerX - pentW / 2, topY - pentH, pentW, 1, roofHi);
+    }
   }
 
   int wx0 = frontX + max(3, w / 7);
   int wy0 = topY + max(5, h / 9);
-  int ww = max(2, w / 9);
-  int wh = max(2, h / 15);
-  int colStep = max(6, w / 4);
-  int rowStep = max(7, h / 7);
+  int ww = max(2, w / 10);
+  int wh = 2;
+  int colStep = max(9, w / 3);
+  int rowStep = 14;
   int col = 0, row = 0;
   for (int wy = wy0; wy < baseY - wh - 2; wy += rowStep, ++row, col = 0) {
     for (int wx = wx0; wx < frontX + faceW - ww - 1; wx += colStep, ++col) {
-      // 用建筑内部的行列索引决定亮暗(固定，不随屏幕滚动闪烁)
-      uint16_t wc = (((col * 5 + row * 7 + seed * 11) % 6) <= 1) ? win : winDim;
+      // 固定窗户分布：日间体现玻璃反光，夜间混合暖灯、冷灯和暗窗。
+      int pattern = (col * 5 + row * 7 + seed * 11) % 10;
+      uint16_t wc;
+      if (night > 0.5f) {
+        wc = (pattern < 4) ? nightWinWarm : ((pattern == 4) ? nightWinCool : nightWinOff);
+      } else {
+        wc = (pattern < 7) ? dayWin : dayWinDim;
+      }
       gfxBox(wx, wy, ww, wh, wc);
     }
   }
 
-  if (h > 48) {
+  if (h > 100 && (seed % 3) == 0) {
     int bandY = topY + h / 2;
-    gfxBox(frontX + 2, bandY, faceW - 4, 1, buildingColor(seed, -18));
+    uint16_t bandC = rLerpColor(buildingColor(seed, -18), RRGB565(70, 54, 94), night);
+    gfxBox(frontX + 2, bandY, faceW - 4, 1, bandC);
   }
 }
 
@@ -1020,9 +1049,13 @@ static void drawForestTree(int x, int baseY, int scale) {
 static void drawForestBackground(int horizonY, uint16_t skyC) {
   int landY = horizonY + 40 + rDecorYOffset;
   if (landY < rSH) gfxBox(0, max(0, landY), rSW, rSH - max(0, landY), RRGB565(54, 132, 68));
-  drawCloud(rSW / 5, horizonY / 3 + 80, 9, 0);
-  drawCloud(rSW * 3 / 5, horizonY / 4 + 80, 8, 1);
-  drawCloud(rSW * 4 / 5, horizonY / 3 + 80, 7, 2);
+  // 云朵在雪山升起完成后渐显(向天空色混合实现淡入)
+  if (rDecorRevealT >= 1.0f && rCloudFade > 0.0f) {
+    uint16_t cloudC = rLerpColor(skyC, R_CLOUD, rCloudFade);
+    drawCloud(rSW / 5, horizonY / 3 + 80, 9, 0, cloudC);
+    drawCloud(rSW * 3 / 5, horizonY / 4 + 80, 8, 1, cloudC);
+    drawCloud(rSW * 4 / 5, horizonY / 3 + 80, 7, 2, cloudC);
+  }
 
   // 雪山：山体深灰蓝 + 山顶白色雪冠
   uint16_t farMt = RRGB565(142, 160, 178);
@@ -1339,14 +1372,19 @@ static void drawUnderwaterBackground(int horizonY) {
   const int rayCenters[5] = { -178, -88, 0, 88, 178 };
   const int rayHalfWidths[5] = { 18, 24, 30, 24, 18 };
   float rayTime = millis() * 0.001f;
+  float horizontalSweep = sinf(rayTime * 0.90f); // 左→右→左平滑往返
+  float brightCenter = (horizontalSweep + 1.0f) * 2.0f; // 亮度焦点在第 0..4 根光柱间横向移动
+  int bottomSweepX = (int)lroundf(horizontalSweep * 22.0f);
+  int topSweepX = (int)lroundf(horizontalSweep * 4.0f);
   for (int i = 0; i < 5; ++i) {
-    // 五根光柱使用不同相位和轻微不同的周期缓慢明暗变化，模拟水下光照流动。
-    float pulse = 0.5f + 0.5f * sinf(rayTime * (0.65f + i * 0.08f) + i * 1.37f);
-    float rayAlpha = 0.38f + pulse * 0.58f;
-    int bottomX = apexX + rayCenters[i];
+    // 亮度只沿水平方向依次扫过五根光柱，垂直方向保留静态渐隐。
+    float focus = constrain(1.0f - fabsf((float)i - brightCenter) / 1.55f, 0.0f, 1.0f);
+    focus = focus * focus * (3.0f - 2.0f * focus);
+    float rayAlpha = 0.34f + focus * 0.62f;
+    int bottomX = apexX + rayCenters[i] + bottomSweepX;
     int topHalf = (i == 2) ? 8 : 5;
-    int topLeft = apexX - topHalf;
-    int topRight = apexX + topHalf;
+    int topLeft = apexX + topSweepX - topHalf;
+    int topRight = apexX + topSweepX + topHalf;
     int bottomLeft = bottomX - rayHalfWidths[i];
     int bottomRight = bottomX + rayHalfWidths[i];
     int visibleTopY = max(0, rayTopY);
@@ -1420,12 +1458,17 @@ static void drawUnderwaterBackground(int horizonY) {
 
 static void drawCityBackground(int horizonY, uint16_t skyC, float night) {
   if (night < 0.55f) {
-    // 4 朵不同形态、不同大小的云
-    drawCloud(rSW / 6,     horizonY / 3,     13, 0);  // 大蓬松云(左)
-    drawCloud(rSW * 2 / 5, horizonY / 5,     7,  2);  // 小团云(中上)
-    drawCloud(rSW * 3 / 5, horizonY / 3 + 10, 11, 3); // 高耸云(右中)
-    drawCloud(rSW * 5 / 6, horizonY / 4,     9,  1);  // 长条云(右)
-    if (rSceneIdx == 0 || rSceneFrom == 0) drawDayAirplane(horizonY);
+    // 云朵在高楼升起完成后渐显(向天空色混合实现淡入)
+    if (rDecorRevealT >= 1.0f && rCloudFade > 0.0f) {
+      uint16_t cloudC = rLerpColor(skyC, R_CLOUD, rCloudFade);
+      drawCloud(rSW / 9,     horizonY / 6 + 40,        4, 4, cloudC);  // 远处小卷云(高空、最小)
+      drawCloud(rSW / 2,     horizonY / 5 + 40,        6, 2, cloudC);  // 中远处小团云
+      drawCloud(rSW * 7 / 10, horizonY / 4 + 40,       8, 1, cloudC);  // 中处长条云
+      drawCloud(rSW / 6,     horizonY / 3 + 40,       16, 0, cloudC);  // 近处大蓬松云(最大)
+      drawCloud(rSW * 3 / 5, horizonY / 3 + 10 + 40,  11, 3, cloudC);  // 中近处高耸云
+      drawCloud(rSW * 5 / 6, horizonY / 4 + 40,        9, 5, cloudC);  // 中处双层堆叠云
+      drawCloud(rSW / 20,    horizonY / 3 + 55,       10, 1, cloudC);  // 近处偏左长条云
+    }
   } else {
     const int starCount = 30;
     int starMaxY = max(24, roadBodyTopY() - 8);
@@ -1450,18 +1493,38 @@ static void drawCityBackground(int horizonY, uint16_t skyC, float night) {
 
   const int SAG2 = rSH / 7;
   const int SKY_OFFSET = 50;
-  for (int i = 0; i < 12; ++i) {
-    int bw = 22 + (i % 4) * 7;
-    int bh = 28 + ((i * 11) % 38);
-    int extraDown = (i < 3) ? 10 : (i == 11 ? 20 : (i == 10 ? 30 : (i == 9 ? 10 : 0)));
-    int bx = -10 + i * 42;
+
+  // 远景天际线：较矮、较暗，先建立城市纵深。
+  for (int i = 0; i < 9; ++i) {
+    int bw = 24 + (i % 3) * 5;
+    int bh = 34 + cityRand(i, 53, 24);
+    int bx = -10 + i * 58;
+    int baseHY = horizonYAt(bx + bw / 2, SAG2) + SKY_OFFSET + 13 + rDecorYOffset;
+    uint16_t farDay = buildingColor(i + 40, -30);
+    uint16_t farNight = RRGB565(15 + (i % 3) * 3, 16 + (i % 2) * 3, 38 + (i % 4) * 4);
+    uint16_t farC = rLerpColor(farDay, farNight, night);
+    gfxBox(bx, baseHY - bh, bw, bh + 14, farC);
+    gfxBox(bx, baseHY - bh, bw, 1,
+           rLerpColor(buildingColor(i + 40, -8), RRGB565(48, 42, 72), night));
+    if ((i % 3) == 0) {
+      uint16_t farWin = rLerpColor(RRGB565(170, 208, 228), RRGB565(238, 204, 112), night);
+      gfxBox(bx + bw / 2, baseHY - bh / 2, 2, 2, farWin);
+    }
+  }
+
+  // 前景只保留 8 栋高低错落的塔楼，留出天空和建筑间的呼吸空间。
+  static const int towerX[8] = {-12, 48, 103, 160, 218, 282, 350, 414};
+  static const int towerW[8] = { 38, 34,  40,  36,  44,  40,  36,  38};
+  static const int towerH[8] = { 56, 76,  64,  97, 118,  88,  73,  55};
+  for (int i = 0; i < 8; ++i) {
+    int bx = towerX[i];
+    int bw = towerW[i];
+    int bh = towerH[i];
     int baseHY = horizonYAt(bx + bw / 2, SAG2) + SKY_OFFSET + rDecorYOffset;
-    uint16_t dayB = buildingColor(i, -8);
-    uint16_t nightB = RRGB565(24 + (i % 3) * 5, 18 + (i % 4) * 4, 48 + (i % 2) * 8);
-    uint16_t b = rLerpColor(dayB, nightB, night);
-    gfxBox(bx, baseHY - bh, bw, bh + extraDown + 20, b);
-    uint16_t win = rLerpColor(RRGB565(210, 236, 248), RRGB565(245, 230, 116), night);
-    if ((i % 2) == 0 || night > 0.5f) gfxBox(bx + bw / 2, baseHY - bh / 2, 3, 4, win);
+    int side = (bx + bw / 2 < rSW / 2) ? -1 : 1;
+    int anchorX = (side < 0) ? bx + bw : bx;
+    int footing = 24 + (i % 3) * 7;
+    drawBuilding(anchorX, baseHY + footing, bw, bh + footing, side, i, night);
   }
 }
 
