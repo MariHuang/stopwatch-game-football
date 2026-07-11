@@ -4,6 +4,7 @@ build/
 .vscode/
 *.tmp
 *.log
+.zcode/
 
 # Local generated previews
 basket_hoop_cutout.png

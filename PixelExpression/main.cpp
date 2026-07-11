@@ -5,6 +5,7 @@
 #include "basket_hoop_sprite.h"
 #include "shot_sound.h"
 #include "miss_sound.h"
+#include "bgm_select.h"   // 选车场景背景音乐
 
 static constexpr uint8_t KEY_A_PIN = 2;  // StopWatch KEYA (yellow)
 static constexpr uint8_t KEY_B_PIN = 1;  // StopWatch KEYB (blue)
@@ -55,6 +56,8 @@ struct RawButton {
 };
 
 static M5Canvas canvas(&M5.Display);
+static M5Canvas hudTextMask(&M5.Display);
+static bool hudTextMaskReady = false;
 static bool useCanvas = false;
 static constexpr int RENDER_W = 466;
 static constexpr int RENDER_H = 466;
@@ -374,6 +377,73 @@ extern "C" {
       textCenter(s, x, y, gfxFontById(font), c, bg);
     }
   }
+  // 真正的文字 Alpha：先把字形画入灰度遮罩，再将目标颜色逐像素混合到当前画面。
+  void gfxTextCenterAlpha(const char* s, int x, int y, int font, int size, uint16_t c, float alpha) {
+    alpha = constrain(alpha, 0.0f, 1.0f);
+    if (alpha <= 0.0f || !s || !*s) return;
+    const lgfx::IFont* textFont = gfxFontById(font);
+    if (alpha >= 0.995f) {
+      if (useCanvas) {
+        canvas.setFont(textFont);
+        canvas.setTextSize(size);
+        canvas.setTextDatum(textdatum_t::middle_center);
+        canvas.setTextColor(c, c);
+        canvas.drawString(s, x, y);
+      } else {
+        M5.Display.setFont(textFont);
+        M5.Display.setTextSize(size);
+        M5.Display.setTextDatum(textdatum_t::middle_center);
+        M5.Display.setTextColor(c, c);
+        M5.Display.drawString(s, x, y);
+      }
+      return;
+    }
+
+    static constexpr int MASK_W = 180;
+    static constexpr int MASK_H = 64;
+    if (!hudTextMaskReady) {
+      hudTextMask.setColorDepth(8);
+      hudTextMaskReady = hudTextMask.createSprite(MASK_W, MASK_H) != nullptr;
+    }
+    if (!hudTextMaskReady) return;
+
+    hudTextMask.fillScreen(0x0000);
+    hudTextMask.setFont(textFont);
+    hudTextMask.setTextSize(size);
+    hudTextMask.setTextDatum(textdatum_t::middle_center);
+    hudTextMask.setTextColor(0xFFFF, 0x0000);
+    hudTextMask.drawString(s, MASK_W / 2, MASK_H / 2);
+
+    int textW = min(MASK_W, (int)hudTextMask.textWidth(s) + 6);
+    int textH = min(MASK_H, (int)hudTextMask.fontHeight() + 6);
+    int mx0 = max(0, (MASK_W - textW) / 2);
+    int my0 = max(0, (MASK_H - textH) / 2);
+    int mx1 = min(MASK_W, mx0 + textW);
+    int my1 = min(MASK_H, my0 + textH);
+    int cr = (c >> 11) & 0x1F, cg = (c >> 5) & 0x3F, cb = c & 0x1F;
+
+    for (int my = my0; my < my1; ++my) {
+      int py = y + my - MASK_H / 2;
+      if (py < 0 || py >= screenH) continue;
+      for (int mx = mx0; mx < mx1; ++mx) {
+        int px = x + mx - MASK_W / 2;
+        if (px < 0 || px >= screenW) continue;
+        uint16_t maskC = (uint16_t)hudTextMask.readPixel(mx, my);
+        int mr = (maskC >> 11) & 0x1F, mg = (maskC >> 5) & 0x3F, mb = maskC & 0x1F;
+        float coverage = ((float)mr / 31.0f + (float)mg / 63.0f + (float)mb / 31.0f) / 3.0f;
+        float a = alpha * coverage;
+        if (a <= 0.002f) continue;
+        uint16_t bg = useCanvas ? (uint16_t)canvas.readPixel(px, py)
+                                : (uint16_t)M5.Display.readPixel(px, py);
+        int br = (bg >> 11) & 0x1F, bg6 = (bg >> 5) & 0x3F, bb = bg & 0x1F;
+        int r = br + (int)((cr - br) * a);
+        int g = bg6 + (int)((cg - bg6) * a);
+        int b = bb + (int)((cb - bb) * a);
+        if (useCanvas) canvas.drawPixel(px, py, (uint16_t)((r << 11) | (g << 5) | b));
+        else M5.Display.drawPixel(px, py, (uint16_t)((r << 11) | (g << 5) | b));
+      }
+    }
+  }
   void gfxTextLeft(const char* s, int x, int y, int font, uint16_t c, uint16_t bg) {
     textLeft(s, x, y, gfxFontById(font), c, bg);
   }
@@ -492,6 +562,28 @@ void playShotSound() {
 void playMissSound() {
   if (!speakerReady) return;
   M5.Speaker.playRaw(MISS_SOUND_DATA, MISS_SOUND_LEN, MISS_SOUND_SAMPLE_RATE, false, 1, 0, true);
+}
+
+// ---- 选车场景背景音乐 ----
+// BGM 用固定虚拟通道，音效用 channel=-1 自动分配，两者互不影响。
+static constexpr int BGM_CHANNEL = 1;        // BGM 固定通道(避开音效自动分配)
+static constexpr uint8_t BGM_VOLUME = 96;    // BGM 音量(低于主音量255，不盖过音效)
+static bool bgmPlaying = false;
+
+void startCarSelectBgm() {
+  if (!speakerReady || bgmPlaying) return;
+  M5.Speaker.setChannelVolume(BGM_CHANNEL, BGM_VOLUME);
+  // repeat=0 在 M5Unified 内部转为 ~0u(无限循环)；用固定通道不抢占音效
+  M5.Speaker.playRaw(BGM_SELECT_DATA, BGM_SELECT_LEN,
+                     BGM_SELECT_SAMPLE_RATE, false, 0,
+                     BGM_CHANNEL, false);
+  bgmPlaying = true;
+}
+
+void stopCarSelectBgm() {
+  if (!bgmPlaying) return;
+  M5.Speaker.stop(BGM_CHANNEL);
+  bgmPlaying = false;
 }
 
 void basketUpdate(float dt, bool shootInput) {
@@ -991,6 +1083,12 @@ void loop() {
   float dt = (now - lastTickMs) / 1000.0f;
   lastTickMs = now;
   dt = clampf(dt, 0.0f, 0.040f);
+
+  // 选车场景背景音乐：进入播放、离开停止(集中守卫，覆盖所有切换路径)
+  static GameMode prevGameMode = MODE_MENU;
+  if (prevGameMode != MODE_CAR_SELECT && gameMode == MODE_CAR_SELECT) startCarSelectBgm();
+  else if (prevGameMode == MODE_CAR_SELECT && gameMode != MODE_CAR_SELECT) stopCarSelectBgm();
+  prevGameMode = gameMode;
 
   if (gameMode == MODE_MENU) {
     // 菜单：触摸点选(点哪个卡片进哪个游戏)，A 确认当前选中
