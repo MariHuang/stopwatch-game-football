@@ -4,6 +4,7 @@
 #include "racing_car_preview.h"   // 选车页高清预览
 #include "racing_coin_sprite.h"
 #include "racing_under_tunnel_sprite.h"
+#include "racing_plane_sprite.h"
 #include "coin_sound.h"
 #include "racing_bgm_sound.h"
 #include <M5Unified.h>
@@ -169,10 +170,16 @@ static int   rCoinScore  = 0;        // 吃到的金币数
 static uint32_t rNextNightMeteorMs = 0;
 static constexpr uint32_t NIGHT_METEOR_INTERVAL_MS = 5000;
 static constexpr int SCENE_COIN_INTERVAL = 10; // 每获得 10 个金币切换一次场景
+static constexpr uint32_t DAY_PLANE_DELAY_MS = 5000;
+static constexpr uint32_t DAY_PLANE_DURATION_MS = 5200;
+static uint32_t rDaySceneEnterMs = 0;
+static uint32_t rDayPlaneStartMs = 0;
+static bool rDayPlanePlayed = false;
 static float rHighScore  = 0.0f;     // 最高分(内存)
 static int   rSceneIdx   = 0;        // 0=城市日间 1=黄昏海边 2=海底隧道 3=城市夜间 4=森林 5=沙漠
 static int   rSceneFrom  = 0;        // 场景过渡起点
 static float rSceneTransT = 1.0f;    // 切场景后的颜色/道路过渡进度(1s)
+static float rDecorExitT = 1.0f;     // 切场景时旧装饰层向下退出进度
 static float rDecorRevealT = 1.0f;   // 装饰层(高楼/高山/大海)升起进度(1.5s，海底隧道 1s)
 static int   rDecorYOffset = 0;      // 切场景时装饰层从赛道背后向上升起
 static float rCloudFade = 1.0f;      // 云朵渐显进度：装饰层升起完成后 0→1(约1s)
@@ -187,7 +194,7 @@ static constexpr uint8_t COIN_SOUND_VOLUME = 120;
 static uint8_t rNextCoinSoundChannel = 3; // 通道 3..7 轮流使用，允许连续金币音效重叠
 static bool rRacingBgmPlaying = false;
 static constexpr int RACING_BGM_CHANNEL = 2; // 与选车 BGM 的通道 1 分离
-static constexpr uint8_t RACING_BGM_VOLUME = 160;
+static constexpr uint8_t RACING_BGM_VOLUME = 220;
 static bool  rExitFlag   = false;
 static bool  rOffTrack   = false;       // 是否冲出赛道
 static uint32_t rOffTrackUntil = 0;     // 冲出赛道后 Game Over 倒计时
@@ -227,27 +234,51 @@ static void startRacingBgm();
 static void stopRacingBgm();
 
 static void updateSceneState(float dt) {
+  uint32_t now = millis();
   int nextScene = (rCoinScore / SCENE_COIN_INTERVAL) % 6;
   if (nextScene != rSceneIdx) {
     rSceneFrom = rSceneIdx;
     rSceneIdx = nextScene;
     rSceneTransT = 0.0f;
+    rDecorExitT = 0.0f;
     rDecorRevealT = 0.0f;
     rCloudFade = 0.0f;   // 切场景时云朵重置为不可见，等装饰层升起后再渐显
     if (rSceneIdx == 3) {
-      rNextNightMeteorMs = millis() + NIGHT_METEOR_INTERVAL_MS;
+      rNextNightMeteorMs = now + NIGHT_METEOR_INTERVAL_MS;
     } else {
       rNextNightMeteorMs = 0;
       rMeteor.active = false;
+    }
+    if (rSceneIdx == 0) {
+      rDaySceneEnterMs = now;
+      rDayPlaneStartMs = 0;
+      rDayPlanePlayed = false;
+    } else {
+      rDayPlaneStartMs = 0;
+      rDayPlanePlayed = false;
+    }
+  }
+  if (rSceneIdx == 0) {
+    if (!rDayPlanePlayed && (uint32_t)(now - rDaySceneEnterMs) >= DAY_PLANE_DELAY_MS) {
+      rDayPlaneStartMs = now;
+      rDayPlanePlayed = true;
+    } else if (rDayPlaneStartMs != 0 &&
+               (uint32_t)(now - rDayPlaneStartMs) >= DAY_PLANE_DURATION_MS) {
+      rDayPlaneStartMs = 0;
     }
   }
   if (rSceneTransT < 1.0f) {
     rSceneTransT += dt;   // 颜色/道路过渡：1秒完成
     if (rSceneTransT > 1.0f) rSceneTransT = 1.0f;
   }
-  // 装饰层升起：海底隧道 1s，其它场景 1.5s
-  if (rDecorRevealT < 1.0f) {
-    float revealSpeed = (rSceneIdx == 2) ? 1.0f : (1.0f / 1.5f);
+  // 切场景时：旧装饰层先向下退出，然后新装饰层再升起；天空/赛道仍按 rSceneTransT 过渡。
+  if (rSceneFrom != rSceneIdx && rDecorExitT < 1.0f) {
+    rDecorExitT += dt * (1.0f / 0.7f);
+    if (rDecorExitT > 1.0f) rDecorExitT = 1.0f;
+  } else if (rDecorRevealT < 1.0f) {
+    // 装饰层升起：黄昏大海/森林雪山/沙漠高山更快露出，海底隧道 1s，其它场景 1.5s
+    float revealSpeed = (rSceneIdx == 1 || rSceneIdx == 4 || rSceneIdx == 5) ? (1.0f / 0.75f) :
+                        ((rSceneIdx == 2) ? 1.0f : (1.0f / 1.5f));
     rDecorRevealT += dt * revealSpeed;
     if (rDecorRevealT > 1.0f) rDecorRevealT = 1.0f;
   }
@@ -343,9 +374,13 @@ void racingInit() {
   rNextCoinDist = 180.0f;
   rCoinScore = 0;
   rNextNightMeteorMs = 0;
+  rDaySceneEnterMs = millis();
+  rDayPlaneStartMs = 0;
+  rDayPlanePlayed = false;
   rSceneIdx = 0;
   rSceneFrom = 0;
   rSceneTransT = 0.0f;   // 开场也有从下往上升起的动画
+  rDecorExitT = 1.0f;
   rDecorRevealT = 0.0f;
   rCloudFade = 0.0f;     // 开场云朵也从升起后渐显
   rTimeOfDay = 0.0f;
@@ -790,9 +825,13 @@ static void racingRestart() {
   rNextCoinDist = 180.0f;
   rCoinScore = 0;
   rNextNightMeteorMs = 0;
+  rDaySceneEnterMs = millis();
+  rDayPlaneStartMs = 0;
+  rDayPlanePlayed = false;
   rSceneIdx = 0;
   rSceneFrom = 0;
   rSceneTransT = 0.0f;   // 开场也有从下往上升起的动画
+  rDecorExitT = 1.0f;
   rDecorRevealT = 0.0f;
   rCloudFade = 0.0f;     // 开场云朵也从升起后渐显
   rTimeOfDay = 0.0f;
@@ -941,6 +980,62 @@ static void drawMeteor() {
   gfxPixel(headX - 1, headY, cHead);
   gfxPixel(headX, headY + 1, cHead);
   gfxPixel(headX, headY - 1, cHead);
+}
+
+static uint16_t blendPixelAlpha565(uint16_t bgC, uint16_t fgC, int alpha) {
+  alpha = constrain(alpha, 0, 255);
+  if (alpha <= 0) return bgC;
+  if (alpha >= 255) return fgC;
+  int br = (bgC >> 11) & 0x1F, bg = (bgC >> 5) & 0x3F, bb = bgC & 0x1F;
+  int fr = (fgC >> 11) & 0x1F, fg = (fgC >> 5) & 0x3F, fb = fgC & 0x1F;
+  int r = br + ((fr - br) * alpha) / 255;
+  int g = bg + ((fg - bg) * alpha) / 255;
+  int b = bb + ((fb - bb) * alpha) / 255;
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+static void drawDayPlaneFlyover() {
+  if (rSceneIdx != 0 || rDayPlaneStartMs == 0) return;
+  uint32_t elapsed = millis() - rDayPlaneStartMs;
+  if (elapsed >= DAY_PLANE_DURATION_MS) return;
+
+  float t = constrain((float)elapsed / (float)DAY_PLANE_DURATION_MS, 0.0f, 1.0f);
+  float moveEase = 1.0f - powf(1.0f - t, 1.35f);  // 起步就有速度：从屏幕外直接飞入，避免开头停顿。
+  float scaleEase = t * t * (3.0f - 2.0f * t);
+  const float startScale = 1.05f;
+  const float endScale = 0.0052f;
+  float scale = startScale + (endScale - startScale) * scaleEase;  // 从近处飞入，向更远端缩成点消失。
+  int dstW = max(4, (int)(RACING_PLANE_W * scale));
+  int dstH = max(2, (int)(RACING_PLANE_H * scale));
+  int startCenterY = rSH + dstH / 2 + 8;
+  int endCenterY = max(10, gHorizonY() - 130);
+  int cy = startCenterY + (int)((endCenterY - startCenterY) * moveEase);
+  int y0 = cy - dstH / 2;
+  int cx = rSW / 2;
+  int x0 = cx - dstW / 2;
+  float fade = (t < 0.88f) ? 1.0f : (1.0f - (t - 0.88f) / 0.12f);
+  fade = constrain(fade, 0.0f, 1.0f);
+
+  int dy0 = max(0, -y0);
+  int dy1 = min(dstH - 1, rSH - 1 - y0);
+  int dx0 = max(0, -x0);
+  int dx1 = min(dstW - 1, rSW - 1 - x0);
+  if (dy1 < dy0 || dx1 < dx0) return;
+
+  for (int dy = dy0; dy <= dy1; ++dy) {
+    int py = y0 + dy;
+    int sy = (dy * RACING_PLANE_H) / dstH;
+    for (int dx = dx0; dx <= dx1; ++dx) {
+      int px = x0 + dx;
+      int sxImg = (dx * RACING_PLANE_W) / dstW;
+      int srcIdx = sy * RACING_PLANE_W + sxImg;
+      int alpha = (int)(pgm_read_byte(&RACING_PLANE_ALPHA[srcIdx]) * fade);
+      if (alpha <= 2) continue;
+      uint16_t c = pgm_read_word(&RACING_PLANE_PIXELS[srcIdx]);
+      if (alpha >= 250) gfxPixel(px, py, c);
+      else gfxPixel(px, py, blendPixelAlpha565(gfxReadPixel(px, py), c, alpha));
+    }
+  }
 }
 
 static void drawBuilding(int x, int baseY, int w, int h, int side, int seed, float night) {
@@ -1328,7 +1423,13 @@ static void drawUnderwaterTunnelImage() {
   int tunnelCx = roadTopCx + tunnelComp;
   int x0 = tunnelCx - UNDER_TUNNEL_SPRITE_W / 2;
   int y0 = roadBodyTopY() - UNDER_TUNNEL_SPRITE_H + 64 + rDecorYOffset;
-  const uint16_t colors[3] = { 0, RRGB565(0, 15, 26), RRGB565(96, 186, 255) };
+  const uint16_t tunnelDark = RRGB565(0, 15, 26);
+  const uint16_t tunnelDarkLit = RRGB565(8, 62, 108);
+  const uint16_t tunnelBlue = RRGB565(96, 186, 255);
+  const uint16_t tunnelBlueLit = RRGB565(190, 236, 255);
+  float tunnelTime = millis() * 0.001f;
+  float lightTravel = 1.0f - fmodf(tunnelTime * 2.05f, 1.0f);
+  if (lightTravel >= 1.0f) lightTravel = 0.0f;
 
   // 直接从 2-bit PROGMEM 资源按同色横向区段绘制，不再申请约 193 KB 的连续 PSRAM。
   // 每帧约 2340 个短线段，资源无法因内存碎片或 PSRAM 分配失败而消失。
@@ -1336,6 +1437,20 @@ static void drawUnderwaterTunnelImage() {
     int py = y0 + y;
     // 不在这里水平裁切底部；稍后绘制的弧形赛道路面会自然覆盖骨架，形成契合的弧形边界。
     if (py < 0 || py >= rSH) continue;
+    float rowT = (float)y / (float)max(1, UNDER_TUNNEL_SPRITE_H - 1); // 0=远端, 1=近端
+    float phase = rowT - lightTravel;
+    if (phase < 0.0f) phase += 1.0f;
+    float leadPulse = (phase < 0.16f) ? (1.0f - phase / 0.16f) : 0.0f;
+    float tailPulse = (phase > 0.78f) ? ((phase - 0.78f) / 0.22f) : 0.0f;
+    float pulse = max(leadPulse, tailPulse * 0.42f);
+    pulse = pulse * pulse * (3.0f - 2.0f * pulse);
+    float flicker = 0.82f + 0.18f * sinf(tunnelTime * 14.0f + y * 0.19f);
+    float glow = constrain(pulse * flicker, 0.0f, 1.0f);
+    uint16_t rowColors[3] = {
+      0,
+      rLerpColor(tunnelDark, tunnelDarkLit, glow * 0.72f),
+      rLerpColor(tunnelBlue, tunnelBlueLit, glow)
+    };
     int row = y * UNDER_TUNNEL_SPRITE_STRIDE;
     int x = 0;
     while (x < UNDER_TUNNEL_SPRITE_W) {
@@ -1352,7 +1467,7 @@ static void drawUnderwaterTunnelImage() {
         if (nextLevel != level) break;
         ++x;
       }
-      gfxBox(x0 + runStart, py, x - runStart, 1, colors[level]);
+      gfxBox(x0 + runStart, py, x - runStart, 1, rowColors[level]);
     }
   }
 }
@@ -1464,10 +1579,9 @@ static void drawCityBackground(int horizonY, uint16_t skyC, float night) {
       drawCloud(rSW / 9,     horizonY / 6 + 40,        4, 4, cloudC);  // 远处小卷云(高空、最小)
       drawCloud(rSW / 2,     horizonY / 5 + 40,        6, 2, cloudC);  // 中远处小团云
       drawCloud(rSW * 7 / 10, horizonY / 4 + 40,       8, 1, cloudC);  // 中处长条云
-      drawCloud(rSW / 6,     horizonY / 3 + 40,       16, 0, cloudC);  // 近处大蓬松云(最大)
+      drawCloud(rSW / 6,     horizonY / 3 + 40,       16, 5, cloudC);  // 近处大双层堆叠云(最大)
       drawCloud(rSW * 3 / 5, horizonY / 3 + 10 + 40,  11, 3, cloudC);  // 中近处高耸云
       drawCloud(rSW * 5 / 6, horizonY / 4 + 40,        9, 5, cloudC);  // 中处双层堆叠云
-      drawCloud(rSW / 20,    horizonY / 3 + 55,       10, 1, cloudC);  // 近处偏左长条云
     }
   } else {
     const int starCount = 30;
@@ -1559,6 +1673,46 @@ static void drawRoadSurface(uint16_t edgeC, uint16_t roadC, uint16_t dashC) {
       float cover = constrain((rightF - ((float)x + 0.5f)) / 2.0f, 0.0f, 1.0f);
       if (cover <= 0.0f || cover >= 1.0f) continue;
       gfxPixel(x, y, rLerpColor(edgeC, roadC, cover));
+    }
+  }
+
+  // 赛道两侧实线：跟随椭圆边缘轨迹，颜色跟随当前场景虚线颜色，线宽按透视远小近大。
+  static const float sideLinePos[2] = { -0.76f, 0.76f };
+  const int sidePieces = 96;
+  for (int side = 0; side < 2; ++side) {
+    int prevX = -1, prevY = -1, prevHalfW = 0;
+    float prevEmerge = 0.0f;
+    for (int i = 0; i <= sidePieces; ++i) {
+      float t = 0.995f - 0.955f * (float)i / (float)sidePieces;
+      int yg, hwg;
+      roadGeom(t, yg, hwg);
+      float yy = ((float)yg - roadTop) / roadH;
+      yy = constrain(yy, 0.0f, 1.0f);
+      int roadCx = rSW / 2 - (int)(rCamX * (0.25f + 0.75f * yy)) +
+                   (int)(rCurve * (1.0f - yy) * (1.0f - yy) * CURVE_STRENGTH * (rSW * 0.5f));
+      roadCx -= (int)(rCarX * 39.0f * (1.0f - yy));
+      int cx = roadCx + (int)(sideLinePos[side] * hwg);
+      float near = constrain(1.0f - t, 0.0f, 1.0f);
+      int lineW = max(3, (int)(3.0f + 14.0f * powf(near, 0.72f)));
+      int halfLineW = lineW / 2;
+      float emerge = constrain((0.995f - t) / 0.075f, 0.0f, 1.0f);
+      emerge = emerge * emerge * (3.0f - 2.0f * emerge);
+      if (i > 0) {
+        float dx = cx - prevX, dy = yg - prevY;
+        float len = sqrtf(dx * dx + dy * dy);
+        float segAlpha = min(0.96f, (prevEmerge + emerge) * 0.5f);
+        if (len > 0.5f && segAlpha > 0.02f) {
+          float nx = -dy / len, ny = dx / len;
+          int phx = (int)lroundf(nx * prevHalfW), phy = (int)lroundf(ny * prevHalfW);
+          int chx = (int)lroundf(nx * halfLineW), chy = (int)lroundf(ny * halfLineW);
+          fillQuadAlpha(prevX + phx, prevY + phy, prevX - phx, prevY - phy,
+                        cx - chx, yg - chy, cx + chx, yg + chy, dashC, segAlpha);
+        }
+      }
+      prevX = cx;
+      prevY = yg;
+      prevHalfW = halfLineW;
+      prevEmerge = emerge;
     }
   }
 
@@ -1683,17 +1837,18 @@ static void drawSkyAndRoad() {
   uint32_t tBg = 0, tRoad = 0, tDecor = 0;
   uint32_t t0 = micros();
   int revealOffset = 0;
-  if (rDecorRevealT < 1.0f) {
-    // 升起动画用 rDecorRevealT(非海底 1.5s)，颜色过渡用 rSceneTransT(1s)
+  if (rSceneFrom != rSceneIdx && rDecorExitT < 1.0f) {
+    float exitEase = rDecorExitT * rDecorExitT * (3.0f - 2.0f * rDecorExitT);
+    int exitOffset = (int)(exitEase * (float)(rSH * 0.36f));
+    drawSceneDecor(rSceneFrom, exitOffset);
+  } else if (rDecorRevealT < 1.0f) {
+    // 开场高楼仍跟随玩家车入场；切场景时等旧层向下退出后，新层再升起。
     bool openingCityReveal = (rSceneFrom == 0 && rSceneIdx == 0);
-    // 装饰层升起用 rDecorRevealT，颜色过渡用 mixT(1s)
     float revealEase = openingCityReveal ? racingIntroEase() : rDecorRevealT;
     float revealDistance = openingCityReveal
                              ? (float)RACING_CITY_INTRO_OFFSET
                              : (float)(rSH * 0.32f);
     revealOffset = (int)((1.0f - revealEase) * revealDistance);
-    // 场景不同时才画旧场景底图；相同时(如开场)只画新场景升起动画
-    if (rSceneFrom != rSceneIdx && mixT < 0.45f) drawSceneDecor(rSceneFrom, 0);
     drawSceneDecor(rSceneIdx, revealOffset);
   } else {
     drawSceneDecor(rSceneIdx, 0);
@@ -2094,7 +2249,7 @@ static void drawPlayerCar() {
   int y0 = carBottom - dstH + 4;
 
   drawHeadlights(cx, carBottom, dstW, dstH, 0.0f, true, R_LANES[rTargetLane]);
-  // 整车投影：使用玩家车 mask 的轮廓压扁生成，比几何梯形更自然。
+  // 整车投影：直接使用玩家车 sprite 的 mask 压扁生成车身形状，不再叠加椭圆/大团阴影。
   float speedRatio = constrain(rSpeed / 2.04f, 0.0f, 1.0f);
   float bobFreq = 6.0f + speedRatio * 8.0f;
   float bobAmp = 1.5f + speedRatio * 3.5f;
@@ -2102,35 +2257,25 @@ static void drawPlayerCar() {
   float turnAmt = min(1.0f, fabsf(rSteerVis));
   int leanSide = (rSteerVis > 0) ? 1 : (rSteerVis < 0 ? -1 : 0);
   int leanOff = leanSide * (int)(dstW * 0.12f * turnAmt);
-  int shadowH = max(14, dstH * 30 / 100);
-  int shadowTop = carBottom - shadowH + 16 + (int)(bob * 0.35f);
-  float shadowScaleX = (float)(dstW + 18) / (float)srcW;
-  float srcCenter = srcX0 + srcW * 0.5f;
+  int shadowW = max(8, dstW * 116 / 100);
+  int shadowH = max(18, dstH * 58 / 100);
+  int shadowX0 = cx - shadowW / 2;
+  int shadowTop = carBottom - shadowH + 12 + (int)(bob * 0.25f);
   for (int dy = 0; dy < shadowH; ++dy) {
-    int srcY = srcY0 + (dy * srcH) / shadowH;
-    int minX = srcX1 + 1;
-    int maxX = srcX0 - 1;
-    for (int sxImg = srcX0; sxImg <= srcX1; ++sxImg) {
-      int srcIdx = srcY * ENEMY_CAR_W + sxImg;
-      if (!pgm_read_byte(&ENEMY_CAR_MASK[PLAYER_CAR_TYPE][playerView][srcIdx])) continue;
-      if (sxImg < minX) minX = sxImg;
-      if (sxImg > maxX) maxX = sxImg;
-    }
-    if (maxX < minX) continue;
     float rowT = (float)dy / (float)max(1, shadowH - 1);
     int py = shadowTop + dy;
     if (py < 0 || py >= rSH) continue;
     int rowLean = (int)(leanOff * (0.35f + rowT * 0.65f));
-    int outerL = cx + rowLean + (int)((minX - srcCenter) * shadowScaleX) - 3;
-    int outerR = cx + rowLean + (int)((maxX - srcCenter) * shadowScaleX) + 3;
-    int innerL = cx + rowLean + (int)((minX - srcCenter) * (shadowScaleX * 0.94f));
-    int innerR = cx + rowLean + (int)((maxX - srcCenter) * (shadowScaleX * 0.94f));
-    outerL = max(0, outerL);
-    outerR = min(rSW - 1, outerR);
-    innerL = max(0, innerL);
-    innerR = min(rSW - 1, innerR);
-    if (outerR >= outerL) gfxBox(outerL, py, outerR - outerL + 1, 1, RRGB565(22, 8, 38));
-    if (innerR >= innerL) gfxBox(innerL, py, innerR - innerL + 1, 1, RRGB565(10, 4, 22));
+    int srcY = srcY0 + (dy * srcH) / shadowH;
+    for (int dx = 0; dx < shadowW; ++dx) {
+      int sxImg = srcX0 + (dx * srcW) / shadowW;
+      int srcIdx = srcY * ENEMY_CAR_W + sxImg;
+      if (!pgm_read_byte(&ENEMY_CAR_MASK[PLAYER_CAR_TYPE][playerView][srcIdx])) continue;
+      int px = shadowX0 + dx + rowLean;
+      if (px < 0 || px >= rSW) continue;
+      uint16_t bg = gfxReadPixel(px, py);
+      gfxPixel(px, py, blendPixelAlpha565(bg, RRGB565(12, 5, 24), 204)); // 80% opacity
+    }
   }
 
   // 绘制玩家车精灵(红色吉普，按车道切换左/正后/右视图)
@@ -2268,6 +2413,7 @@ void racingDraw() {
   drawPlayerCar();
   uint32_t tD = micros();
   drawCoinPops();
+  drawDayPlaneFlyover();
   drawHUD();
   uint32_t tE = micros();
   if (rGameOver) drawGameOver();
