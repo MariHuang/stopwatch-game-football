@@ -1245,7 +1245,7 @@ void loop() {
   }
 
   if (gameMode == MODE_RACING) {
-    // 赛车：触摸转向，A 加速，B 刹车；Game Over 后 A 重开，B 返回菜单
+    // 赛车：触摸转向，KeyA 降低音量，KeyB 增加音量；Game Over 后 A 重开，B 返回菜单
     float steerX = 0.0f;
     if (M5.Touch.isEnabled() && M5.Touch.getCount() > 0) {
       auto& pt = M5.Touch.getTouchPointRaw(0);
@@ -1256,10 +1256,14 @@ void loop() {
       if (passPressed) racingRestartFromExternal();
       else if (shootPressed) { gameMode = MODE_MENU; }
     } else if (racingIsIntroActive()) {
+      if (passPressed) racingAdjustVolume(-20);
+      if (shootPressed) racingAdjustVolume(20);
       // 入场动画期间：只更新不处理输入，避免从选车页带入手势误触
       racingUpdate(dt);
     } else {
-      racingHandleInput(passPressed, shootPressed, steerX);
+      if (passPressed) racingAdjustVolume(-20);
+      if (shootPressed) racingAdjustVolume(20);
+      racingHandleInput(false, false, steerX);
       racingUpdate(dt);
     }
     racingDraw();

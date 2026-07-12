@@ -19,6 +19,10 @@ void racingDraw();
 // 处理输入：accel=加速(A), brake=刹车(B), steerX=转向(-1左..+1右)
 void racingHandleInput(bool accel, bool brake, float steerX);
 
+// 赛车游戏音量控制：delta<0 降低，delta>0 增加；影响赛车 BGM 和金币音效
+void racingAdjustVolume(int delta);
+uint8_t racingGetVolume();
+
 // 赛车游戏是否处于 Game Over 状态
 bool racingIsGameOver();
 bool racingIsIntroActive();   // 入场动画是否进行中
