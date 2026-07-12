@@ -1421,8 +1421,19 @@ static void drawUnderwaterTunnelImage() {
   // 避免原先越过中心阈值时补偿量从 20px 瞬间跳到 0px 所造成的晃动。
   int tunnelComp = (int)roundf(constrain(rCarX, -1.0f, 1.0f) * 20.0f);
   int tunnelCx = roadTopCx + tunnelComp;
-  int x0 = tunnelCx - UNDER_TUNNEL_SPRITE_W / 2;
-  int y0 = roadBodyTopY() - UNDER_TUNNEL_SPRITE_H + 64 + rDecorYOffset;
+  // 等比放大骨架(横向纵向同比例)，让它左右超出屏幕，营造更近的隧道压迫感
+  const float tunnelScale = 1.3f;
+  int scaledW = (int)(UNDER_TUNNEL_SPRITE_W * tunnelScale);
+  int scaledH = (int)(UNDER_TUNNEL_SPRITE_H * tunnelScale);
+  int x0 = tunnelCx - scaledW / 2;
+  // 海底隧道退出时原地渐隐(不做向下退出偏移)，其它场景退出/升起仍跟随 rDecorYOffset
+  bool exiting = (rSceneFrom == 2 && rSceneIdx != 2 && rDecorExitT < 1.0f);
+  int yOffset = exiting ? 24 : (rDecorYOffset + 24);  // 退出时保持原位(仅 +24 微调)
+  int y0 = roadBodyTopY() - scaledH + 64 + yOffset;
+  int rowH = max(1, (int)ceilf(tunnelScale));  // 每个精灵行画 rowH 像素高，避免缩放后出现水平缝隙
+  // 退出渐隐 alpha：1→0，骨架颜色向海水色混合实现原地消失
+  const uint16_t waterBg = RRGB565(0x0D, 0x6D, 0xDA);
+  float exitFade = exiting ? (1.0f - rDecorExitT) : 1.0f;
   const uint16_t tunnelDark = RRGB565(0, 15, 26);
   const uint16_t tunnelDarkLit = RRGB565(8, 62, 108);
   const uint16_t tunnelBlue = RRGB565(96, 186, 255);
@@ -1434,9 +1445,9 @@ static void drawUnderwaterTunnelImage() {
   // 直接从 2-bit PROGMEM 资源按同色横向区段绘制，不再申请约 193 KB 的连续 PSRAM。
   // 每帧约 2340 个短线段，资源无法因内存碎片或 PSRAM 分配失败而消失。
   for (int y = 0; y < UNDER_TUNNEL_SPRITE_H; ++y) {
-    int py = y0 + y;
+    int py = y0 + (int)(y * tunnelScale);
     // 不在这里水平裁切底部；稍后绘制的弧形赛道路面会自然覆盖骨架，形成契合的弧形边界。
-    if (py < 0 || py >= rSH) continue;
+    if (py + rowH <= 0 || py >= rSH) continue;
     float rowT = (float)y / (float)max(1, UNDER_TUNNEL_SPRITE_H - 1); // 0=远端, 1=近端
     float phase = rowT - lightTravel;
     if (phase < 0.0f) phase += 1.0f;
@@ -1451,6 +1462,11 @@ static void drawUnderwaterTunnelImage() {
       rLerpColor(tunnelDark, tunnelDarkLit, glow * 0.72f),
       rLerpColor(tunnelBlue, tunnelBlueLit, glow)
     };
+    // 退出时整体向海水色渐隐
+    if (exitFade < 1.0f) {
+      rowColors[1] = rLerpColor(waterBg, rowColors[1], exitFade);
+      rowColors[2] = rLerpColor(waterBg, rowColors[2], exitFade);
+    }
     int row = y * UNDER_TUNNEL_SPRITE_STRIDE;
     int x = 0;
     while (x < UNDER_TUNNEL_SPRITE_W) {
@@ -1467,7 +1483,11 @@ static void drawUnderwaterTunnelImage() {
         if (nextLevel != level) break;
         ++x;
       }
-      gfxBox(x0 + runStart, py, x - runStart, 1, rowColors[level]);
+      // 坐标乘 tunnelScale 实现等比放大；中心对齐 tunnelCx
+      int drawX = x0 + (int)(runStart * tunnelScale);
+      int drawW = (int)(x * tunnelScale) - (int)(runStart * tunnelScale);
+      int drawH = min(rowH, rSH - py);  // 不超出屏幕底部
+      if (drawH > 0) gfxBox(drawX, py, drawW, drawH, rowColors[level]);
     }
   }
 }
