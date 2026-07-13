@@ -140,6 +140,7 @@ static float basketEndX = 0.0f;
 static float basketEndY = 0.0f;
 static float basketSpin = 0.0f;
 static float basketPower = 0.0f;
+static int basketShotPoints = 2;      // 当前投篮得分(2 或 3)，用力甩=3分球
 static float basketLastAccelMag = 1.0f;
 static float basketSwingMeter = 0.0f;
 static bool basketImuReady = false;
@@ -530,9 +531,14 @@ void basketStartShot(float power) {
   basketMissHoopStart = 0;        // 新投篮开始：清掉残留篮筐抖动动画
   basketScoreHighlightUntil = 0;  // 新投篮开始：清掉残留分数高亮
 
+  // 力度判定：power > 1.6 为 3 分球(用力甩=远投)，否则 2 分球
+  basketShotPoints = (power > 1.6f) ? 3 : 2;
   float quality = 1.0f - fabsf(power - 1.35f) * 0.42f;
   quality = clampf(quality, 0.0f, 1.0f);
+  // 3 分球远投更难，命中率额外降低 12%
   int chance = 42 + (int)(quality * 48.0f);
+  if (basketShotPoints == 3) chance -= 12;
+  chance = max(15, chance);
   basketShotMade = (rand() % 100) < chance;
 
   basketStartX = screenW / 2.0f + (rand() % 17 - 8);
@@ -545,7 +551,8 @@ void basketStartShot(float power) {
     basketEndY += (rand() % 24) - 10;
   }
   basketCtrlX = (basketStartX + basketEndX) * 0.5f + (rand() % 41 - 20);
-  basketCtrlY = 30.0f + (rand() % 24);
+  // 3 分球弧线更高(模拟远投高抛物线)，2 分球弧线较低
+  basketCtrlY = (basketShotPoints == 3) ? 8.0f + (rand() % 18) : 30.0f + (rand() % 24);
   basketBallX = basketStartX;
   basketBallY = basketStartY;
   basketBallR = 15.0f;
@@ -644,7 +651,7 @@ void basketUpdate(float dt, bool shootInput) {
     if (basketScorePendingHighlight) {
       basketScorePendingHighlight = false;
       basketMade++;
-      basketScore += 2;
+      basketScore += basketShotPoints;
       if (basketScore > basketBest) basketBest = basketScore;
       basketScoreHighlightUntil = millis() + 3000;   // 渐显0.4+保持2.2+渐隐0.4
     }
@@ -911,7 +918,11 @@ void drawBasketGame() {
   bool swish = basketShotMade && (basketResultReady || highlight);
   bool miss = !basketShotMade && (basketResultReady || missShow);
   if (swish) {
-    textCenter("SWISH!", screenW / 2, statusY, &fonts::Font4, rgb565(242, 174, 38), bg);
+    if (basketShotPoints == 3) {
+      textCenter("3PT SWISH!", screenW / 2, statusY, &fonts::Font4, rgb565(255, 215, 0), bg);
+    } else {
+      textCenter("SWISH!", screenW / 2, statusY, &fonts::Font4, rgb565(242, 174, 38), bg);
+    }
   } else if (miss) {
     textCenter("MISS", screenW / 2, statusY, &fonts::Font4, rgb565(150, 160, 170), bg);
   } else if (!basketShotActive) {
@@ -1246,23 +1257,47 @@ void loop() {
 
   if (gameMode == MODE_RACING) {
     // 赛车：触摸转向，KeyA 降低音量，KeyB 增加音量；Game Over 后 A 重开，B 返回菜单
+    constexpr int RACING_VOLUME_STEP = 26;  // 约 10% 音量
+    constexpr uint32_t RACING_VOLUME_REPEAT_DELAY_MS = 360;
+    constexpr uint32_t RACING_VOLUME_REPEAT_MS = 130;
+    static uint32_t nextVolumeRepeatA = 0;
+    static uint32_t nextVolumeRepeatB = 0;
+    auto volumeRepeat = [&](bool pressed, bool down, uint32_t& nextRepeatAt) {
+      if (!down) {
+        nextRepeatAt = 0;
+        return pressed;
+      }
+      if (pressed) {
+        nextRepeatAt = now + RACING_VOLUME_REPEAT_DELAY_MS;
+        return true;
+      }
+      if (nextRepeatAt != 0 && (int32_t)(now - nextRepeatAt) >= 0) {
+        nextRepeatAt = now + RACING_VOLUME_REPEAT_MS;
+        return true;
+      }
+      return false;
+    };
     float steerX = 0.0f;
     if (M5.Touch.isEnabled() && M5.Touch.getCount() > 0) {
       auto& pt = M5.Touch.getTouchPointRaw(0);
       Vec2 tp = touchToScreen(pt.x, pt.y);
       steerX = clampf((tp.x - screenW / 2.0f) / (screenW / 2.0f), -1.0f, 1.0f);
     }
+    bool passDown = rawA.down || M5.BtnA.isPressed();
+    bool shootDown = rawB.down || M5.BtnB.isPressed();
     if (racingIsGameOver()) {
+      nextVolumeRepeatA = 0;
+      nextVolumeRepeatB = 0;
       if (passPressed) racingRestartFromExternal();
       else if (shootPressed) { gameMode = MODE_MENU; }
     } else if (racingIsIntroActive()) {
-      if (passPressed) racingAdjustVolume(-20);
-      if (shootPressed) racingAdjustVolume(20);
+      if (volumeRepeat(passPressed, passDown, nextVolumeRepeatA)) racingAdjustVolume(-RACING_VOLUME_STEP);
+      if (volumeRepeat(shootPressed, shootDown, nextVolumeRepeatB)) racingAdjustVolume(RACING_VOLUME_STEP);
       // 入场动画期间：只更新不处理输入，避免从选车页带入手势误触
       racingUpdate(dt);
     } else {
-      if (passPressed) racingAdjustVolume(-20);
-      if (shootPressed) racingAdjustVolume(20);
+      if (volumeRepeat(passPressed, passDown, nextVolumeRepeatA)) racingAdjustVolume(-RACING_VOLUME_STEP);
+      if (volumeRepeat(shootPressed, shootDown, nextVolumeRepeatB)) racingAdjustVolume(RACING_VOLUME_STEP);
       racingHandleInput(false, false, steerX);
       racingUpdate(dt);
     }

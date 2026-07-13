@@ -111,7 +111,7 @@ struct Obstacle {
   int   type;     // 0=敌车 1=路障 2=金币
   int   colorIdx; // 敌车车型索引(0..8)
   float sizeMul;  // 敌车大小倍率(0.8..1.3)
-  float npcSpeed; // 预留的 NPC 自身速度；固定在道路上时为 0
+  float npcSpeed; // 保留字段；NPC 车辆固定在赛道上时为 0
   bool  fixed;     // 是否像金币一样固定在道路世界坐标中
   bool  rearCollisionArmed; // 玩家提前稳定跟在同车道时，才允许触发追尾
   bool  active;
@@ -201,6 +201,7 @@ static bool rRacingBgmPlaying = false;
 static constexpr int RACING_BGM_CHANNEL = 2; // 与选车 BGM 的通道 1 分离
 static constexpr uint8_t RACING_BGM_VOLUME = 220;
 static uint8_t rRacingVolume = RACING_BGM_VOLUME;
+static uint32_t rVolumeHudUntil = 0;
 static bool  rExitFlag   = false;
 static bool  rOffTrack   = false;       // 是否冲出赛道
 static uint32_t rOffTrackUntil = 0;     // 冲出赛道后 Game Over 倒计时
@@ -211,10 +212,10 @@ static int PLAYER_CAR_TYPE = 3;   // 默认红色吉普，可被选车页覆盖(
 static const float COIN_SPAWN_Z = 1.08f;       // 金币先在地平线外生成，再随玩家前进进入画面
 static const float COIN_CHAIN_GAP = 0.075f;    // 一串金币之间的前后间距
 static const float COIN_APPROACH_RATE = 0.24f; // 世界固定金币：玩家接近时才慢慢变大
-static const float NPC_RELATIVE_Z_RATE = 0.23f;    // NPC 在车道向前行驶，玩家只按相对速度追近
-static const float NPC_MIN_Z_PER_SEC = 0.075f;     // 防止低速时 NPC 卡在远端太久
-static const float NPC_MAX_Z_PER_SEC = 0.20f;      // 限制近远变化，避免像 NPC 快速往后倒退
-static const float NPC_ADJACENT_MIN_GAP_Z = 0.62f; // 同车道/相邻车道前后至少约两辆车身长度
+static const float ROAD_SCROLL_RATE = 22.0f;   // 路面纹理滚动速度
+static const float ROAD_SCROLL_TO_Z = 0.05f;   // rSroll 到道路深度 t 的换算
+static const float NPC_APPROACH_RATE = ROAD_SCROLL_RATE * ROAD_SCROLL_TO_Z; // NPC 与虚线保持同一赛道速度
+static const float NPC_ADJACENT_MIN_GAP_Z = 0.70f; // 同车道/相邻车道前后至少约两辆车身长度
 static const float NPC_REAR_COLLISION_Z = 0.50f;   // NPC 车尾与玩家车头重合的纵向碰撞线
 static constexpr uint32_t NPC_CENTER_LANE_DELAY_MS = 5000; // 开局前 5 秒中间车道不生成 NPC
 
@@ -250,10 +251,34 @@ static int runnerLaneOffset(float lane, int halfW) {
   return (int)(lane * halfW * RUNNER_LANE_SPAN);
 }
 
+struct CarBounds {
+  int left;
+  int top;
+  int right;
+  int bottom;
+  int width;
+  int height;
+};
+
 static int roadCenterX(float t, int halfW) {
   float p = 1.0f - t;
   return rSW / 2 - (int)(rCamX * (0.25f + 0.75f * p)) +
          (int)(rCurve * t * t * CURVE_STRENGTH * (rSW * 0.5f));
+}
+
+static CarBounds insetCarBounds(CarBounds b, int insetXPct, int insetYPct) {
+  int ix = max(1, b.width * insetXPct / 100);
+  int iy = max(1, b.height * insetYPct / 100);
+  b.left += ix;
+  b.right -= ix;
+  b.top += iy;
+  b.bottom -= max(1, iy / 2);
+  return b;
+}
+
+static bool carBoundsOverlap(CarBounds a, CarBounds b) {
+  return a.left <= b.right && a.right >= b.left &&
+         a.top <= b.bottom && a.bottom >= b.top;
 }
 
 static void fillQuad(int x0, int y0, int x1, int y1, int x2, int y2, int x3, int y3, uint16_t c);
@@ -367,6 +392,76 @@ static int projectX(float laneX, float t, int halfW) {
   return cx + (int)(laneX * halfW) + (int)curveOff;
 }
 
+static bool enemyCarBounds(const Obstacle& o, CarBounds& bounds) {
+  if (!o.active || o.type != 0 || o.z < 0.0f || o.z > 1.0f) return false;
+  int y, halfW;
+  roadGeom(o.z, y, halfW);
+  int cx = roadCenterX(o.z, halfW) + runnerLaneOffset(o.lane, halfW);
+  float npcLaneAdj = halfW * (0.214f - 0.214f * (1.0f - o.z));
+  if (o.lane < -0.34f) cx += (int)npcLaneAdj;
+  else if (o.lane > 0.34f) cx -= (int)npcLaneAdj;
+
+  int view = 1;
+  if (o.lane < -0.34f) view = 0;
+  else if (o.lane > 0.34f) view = 2;
+  int carType = constrain(o.colorIdx, 0, ENEMY_CAR_TYPES - 1);
+  int srcX0 = ENEMY_CAR_BBOX[carType][view][0];
+  int srcY0 = ENEMY_CAR_BBOX[carType][view][1];
+  int srcX1 = ENEMY_CAR_BBOX[carType][view][2];
+  int srcY1 = ENEMY_CAR_BBOX[carType][view][3];
+  int srcW = srcX1 - srcX0 + 1;
+  int srcH = srcY1 - srcY0 + 1;
+
+  const int playerNearH = 76;
+  const int playerBottom = rSH - 16 - 40 - 20;
+  float screenRatio = (float)(y - gHorizonY()) / (float)max(1, playerBottom - gHorizonY());
+  screenRatio = constrain(screenRatio, 0.0f, 1.18f);
+  float perspective = constrain(0.18f + 0.82f * powf(screenRatio, 1.15f), 0.18f, 1.18f);
+  float carTypeScale = (carType == 6) ? 0.85f : 1.0f;
+  int h = max(10, (int)(playerNearH * perspective * carTypeScale));
+  int w = max(8, (int)(h * ((float)srcW / (float)srcH)));
+
+  bounds = { cx - w / 2, y - h, cx - w / 2 + w - 1, y - 1, w, h };
+  return true;
+}
+
+static CarBounds playerCarBounds() {
+  int y, halfW;
+  roadGeom(0.0f, y, halfW);
+  int cx = rSW / 2 + runnerLaneOffset(rCarX, halfW);
+  if (rTargetLane == 0) cx += 78;
+  else if (rTargetLane == 2) cx -= 78;
+  cx += (int)(rSteerVis * 5.0f);
+
+  int carBottom = rSH - 16 - 40 - 20;
+  uint32_t introElapsed = millis() - rIntroStartMs;
+  int surgeOffsetY = 0;
+  if (introElapsed < RACING_CAR_INTRO_MS) {
+    float ease = racingIntroEase();
+    carBottom += (int)((1.0f - ease) * 120.0f);
+  } else {
+    surgeOffsetY = racingStartSurgeOffsetY();
+    carBottom += surgeOffsetY;
+  }
+
+  float surgeFarT = constrain((float)(-surgeOffsetY) / (float)RACING_START_SURGE_PX, 0.0f, 1.0f);
+  int h = max(8, (int)(79 * (1.0f - 0.22f * surgeFarT)));
+  int view = 1;
+  if (rTargetLane == 0) view = 0;
+  else if (rTargetLane == 2) view = 2;
+  int srcX0 = ENEMY_CAR_BBOX[PLAYER_CAR_TYPE][view][0];
+  int srcY0 = ENEMY_CAR_BBOX[PLAYER_CAR_TYPE][view][1];
+  int srcX1 = ENEMY_CAR_BBOX[PLAYER_CAR_TYPE][view][2];
+  int srcY1 = ENEMY_CAR_BBOX[PLAYER_CAR_TYPE][view][3];
+  int srcW = srcX1 - srcX0 + 1;
+  int srcH = srcY1 - srcY0 + 1;
+  int w = max(8, (int)(h * ((float)srcW / (float)srcH)));
+  cx = constrain(cx, w / 2 + 3, rSW - w / 2 - 3);
+  int x0 = cx - w / 2;
+  int y0 = carBottom - h + 4;
+  return { x0, y0, x0 + w - 1, y0 + h - 1, w, h };
+}
+
 static int cityRand(int seed, int salt, int mod);
 
 // 设置玩家车型(0~8)，NPC 会自动跳过该车型
@@ -478,6 +573,28 @@ static bool laneHasNearbyObject(int laneIdx, float z, float gap) {
   return false;
 }
 
+static void enforceNpcAdjacentSpacing() {
+  for (int pass = 0; pass < 2; ++pass) {
+    for (int i = 0; i < OBSTACLE_MAX; ++i) {
+      if (!obstacles[i].active || obstacles[i].type != 0) continue;
+      if (obstacles[i].z < -0.04f || obstacles[i].z > 1.03f) continue;
+      for (int j = i + 1; j < OBSTACLE_MAX; ++j) {
+        if (!obstacles[j].active || obstacles[j].type != 0) continue;
+        if (obstacles[j].z < -0.04f || obstacles[j].z > 1.03f) continue;
+        // 同车道和相邻车道保持纵向距离；左右两侧车道不相邻，允许并排行驶。
+        if (fabsf(obstacles[i].lane - obstacles[j].lane) > 1.01f) continue;
+
+        float dz = fabsf(obstacles[i].z - obstacles[j].z);
+        if (dz >= NPC_ADJACENT_MIN_GAP_Z) continue;
+
+        Obstacle& farCar = (obstacles[i].z >= obstacles[j].z) ? obstacles[i] : obstacles[j];
+        Obstacle& nearCar = (obstacles[i].z >= obstacles[j].z) ? obstacles[j] : obstacles[i];
+        farCar.z = min(1.03f, nearCar.z + NPC_ADJACENT_MIN_GAP_Z);
+      }
+    }
+  }
+}
+
 static bool addObstacleInLane(int laneIdx, float z) {
   if (activeNpcCount() >= 4) return false;
   if (adjacentLaneHasNearbyNpc(laneIdx, z, NPC_ADJACENT_MIN_GAP_Z)) return false;
@@ -490,9 +607,8 @@ static bool addObstacleInLane(int laneIdx, float z) {
       obstacles[i].type = 0;
       obstacles[i].colorIdx = randomNpcCarType();
       obstacles[i].sizeMul = 1.0f;
-      // NPC 自己也在向前开；玩家速度更快时，才按相对速度逐渐追上并超过它。
-      obstacles[i].npcSpeed = 0.50f + (float)(rand() % 45) * 0.01f; // 约 50~94km/h
-      obstacles[i].fixed = false;
+      obstacles[i].npcSpeed = 0.0f;
+      obstacles[i].fixed = true;
       obstacles[i].rearCollisionArmed = false;
       return true;
     }
@@ -642,6 +758,7 @@ static void startCoinVibration() {
 // ---- 输入 ----
 void racingAdjustVolume(int delta) {
   int next = constrain((int)rRacingVolume + delta, 0, 255);
+  rVolumeHudUntil = millis() + 1500;
   if (next == rRacingVolume) return;
   rRacingVolume = (uint8_t)next;
   M5.Speaker.setChannelVolume(RACING_BGM_CHANNEL, rRacingVolume);
@@ -711,7 +828,7 @@ void racingUpdate(float dt) {
   }
   // 入场动画期间(1.5s)：路面以固定速度滚动(车在开)，但不提速/不生成NPC/不计分
   if ((uint32_t)(now - rIntroStartMs) < RACING_INTRO_MS) {
-    rSroll += 0.6f * dt * 35.0f;   // 固定 60km/h 滚动速度，路面动起来
+    rSroll += 0.6f * dt * ROAD_SCROLL_RATE;   // 固定 60km/h 滚动速度，路面动起来
     updateSceneState(dt);
     return;
   }
@@ -741,21 +858,22 @@ void racingUpdate(float dt) {
   rDist += rSpeed * dt * 60.0f;
 
   // 路面纹理滚动（加速，让道路和虚线明显往后跑）
-  rSroll += rSpeed * dt * 35.0f;
+  rSroll += rSpeed * dt * ROAD_SCROLL_RATE;
   // 即时回正，无需衰减
 
   // 赛道恒为直行：不生成弯道(rCurve 永远为 0，所有弯道相关效果自动失效)
 
-  // NPC 在各自车道上向前行驶；玩家更快，所以按“相对速度”追近并超过它。
-  // 同时限制深度变化，避免视觉上像 NPC 自己快速往后倒退。
+  // NPC 固定在赛道上；只有玩家车向前运动，所以 NPC 只按玩家速度进入/离开视野。
   for (int i = 0; i < OBSTACLE_MAX; ++i) {
     if (!obstacles[i].active) continue;
     if (obstacles[i].type == 0) {
-      float relativeSpeed = max(0.0f, rSpeed - obstacles[i].npcSpeed);
-      float zPerSec = constrain(relativeSpeed * NPC_RELATIVE_Z_RATE,
-                                NPC_MIN_Z_PER_SEC,
-                                NPC_MAX_Z_PER_SEC);
-      obstacles[i].z -= dt * zPerSec;
+      float oldZ = obstacles[i].z;
+      obstacles[i].z -= rSpeed * dt * NPC_APPROACH_RATE;
+      // 保险：如果一帧跨过玩家车碰撞区，立即按同车道撞车处理。
+      if (oldZ > NPC_REAR_COLLISION_Z && obstacles[i].z < 0.0f) {
+        float laneDiff = fabsf(obstacles[i].lane - rCarX);
+        if (laneDiff < 0.5f) startRearCrash();
+      }
       continue;
     }
     if (obstacles[i].type == 2) {
@@ -783,6 +901,7 @@ void racingUpdate(float dt) {
       }
     }
   }
+  enforceNpcAdjacentSpacing();
 
   // 障碍生成
   rObstTimer -= dt;
@@ -798,12 +917,20 @@ void racingUpdate(float dt) {
     rNextCoinDist = rDist + 220.0f + (float)(rand() % 220);
   }
 
-  // 碰撞检测：只有提前稳定跟在 NPC 同一车道、随后到达车尾碰撞线才算追尾。
-  // NPC 已进入近端碰撞区后再横向切入属于侧碰，不结束游戏。
+  // 碰撞检测：车身矩形重叠会触发侧碰；稳定同车道跟车仍按原追尾线触发。
+  CarBounds playerHit = insetCarBounds(playerCarBounds(), 22, 20);
   for (int i = 0; i < OBSTACLE_MAX; ++i) {
     if (!obstacles[i].active) continue;
     if (obstacles[i].type == 0) {
       if (obstacles[i].z < 0.0f) continue;
+      CarBounds npcBounds;
+      if (enemyCarBounds(obstacles[i], npcBounds)) {
+        CarBounds npcHit = insetCarBounds(npcBounds, 18, 18);
+        if (carBoundsOverlap(playerHit, npcHit)) {
+          startRearCrash();
+          break;
+        }
+      }
       float targetLaneX = R_LANES[rTargetLane];
       bool laneSettled = fabsf(rCarX - targetLaneX) < 0.10f;
       bool sameLane = fabsf(obstacles[i].lane - targetLaneX) < 0.10f;
@@ -1256,6 +1383,8 @@ static void drawSeagull(int x, int y, int scale, uint16_t c) {
   gfxLine(x - scale, y - scale / 2, x, y, c);
   gfxLine(x, y, x + scale, y - scale / 2, c);
   gfxLine(x + scale, y - scale / 2, x + scale * 2, y, c);
+  gfxLine(x - scale * 2, y + 1, x - scale, y - scale / 2 + 1, c);
+  gfxLine(x + scale, y - scale / 2 + 1, x + scale * 2, y + 1, c);
 }
 
 static void drawDuskBackground(int horizonY, uint16_t skyC) {
@@ -1292,10 +1421,10 @@ static void drawDuskBackground(int horizonY, uint16_t skyC) {
     gfxPixel(x, edgeY, rLerpColor(skyC, edgeSeaC, coverage));
   }
 
-  uint16_t gullC = RRGB565(255, 236, 170);
-  drawSeagull(rSW / 5, horizonY / 2 + 4, 4, gullC);
-  drawSeagull(rSW / 2 + 22, horizonY / 3 + 8, 3, RRGB565(250, 226, 156));
-  drawSeagull(rSW * 3 / 4, horizonY / 2 - 6, 5, RRGB565(246, 220, 148));
+  uint16_t gullC = RRGB565(255, 246, 204);
+  drawSeagull(rSW / 5, horizonY / 2 + 4, 5, gullC);
+  drawSeagull(rSW / 2 + 22, horizonY / 3 + 8, 4, RRGB565(255, 240, 190));
+  drawSeagull(rSW * 3 / 4, horizonY / 2 - 6, 6, RRGB565(255, 236, 182));
 
   uint16_t glint = RRGB565(255, 220, 128);
   for (int i = 0; i < 9; ++i) {
@@ -1851,7 +1980,7 @@ static void drawRoadSurface(uint16_t edgeC, uint16_t roadC, uint16_t dashC) {
   const float dashSpacing = 0.24f;
   const int dashCount = 5;
   const float dashSpawnT = 1.08f;
-  float dashPhase = fmodf(rSroll * 0.05f, dashSpacing);
+  float dashPhase = fmodf(rSroll * ROAD_SCROLL_TO_Z, dashSpacing);
   for (int d = 0; d < 2; ++d) {
     for (int seg = 0; seg < dashCount; ++seg) {
       float dashStart = dashSpawnT - (seg * dashSpacing) - dashPhase;
@@ -2090,14 +2219,14 @@ static void drawEnemyCar(int sx, int baseY, float depth, int carType, float lane
   int dstW = max(8, (int)(dstH * carAspect));
   int x0 = sx - dstW / 2;
   int y0 = baseY - dstH;
-  int clipTop = roadBodyTopY();
+  int clipTop = max(gHorizonY() + 2, min(roadBodyTopY(), y0));
 
   drawHeadlights(sx, baseY, dstW, dstH, depth, false, lane);
   gfxEllipse(sx, baseY - max(1, dstH / 18), max(4, dstW / 3), max(1, dstH / 14), RRGB565(16, 18, 20));
   for (int dy = 0; dy < dstH; ++dy) {
     int sy = srcY0 + (dy * srcH) / dstH;
     int py = y0 + dy;
-      if (py < clipTop || py >= rSH) continue;
+    if (py < clipTop || py >= rSH) continue;
     for (int dx = 0; dx < dstW; ++dx) {
       int sxImg = srcX0 + (dx * srcW) / dstW;
       int px = x0 + dx;
@@ -2530,6 +2659,60 @@ static void drawHUD() {
   }
 }
 
+// 音量调节提示：顶部短弧连续显示，调节后短暂显示并渐隐。
+static void drawVolumeHud() {
+  uint32_t now = millis();
+  if ((int32_t)(rVolumeHudUntil - now) <= 0) return;
+
+  uint32_t remain = rVolumeHudUntil - now;
+  float alpha = (remain < 400) ? (float)remain / 400.0f : 1.0f;
+  uint16_t activeColor = RRGB565(170, 174, 178);
+  uint16_t inactiveColor = RRGB565(0, 0, 0);
+  int alpha255 = (int)(alpha * 255.0f);
+
+  auto alphaPixel = [&](int x, int y, uint16_t color, int opacity) {
+    if (x < 0 || x >= rSW || y < 0 || y >= rSH) return;
+    uint16_t bg = gfxReadPixel(x, y);
+    gfxPixel(x, y, blendPixelAlpha565(bg, color, opacity));
+  };
+  auto alphaDot = [&](int x, int y, uint16_t color, int opacity, int radius) {
+    for (int dy = -radius; dy <= radius; ++dy)
+      for (int dx = -radius; dx <= radius; ++dx)
+        if (dx * dx + dy * dy <= radius * radius)
+          alphaPixel(x + dx, y + dy, color, opacity);
+  };
+
+  const int cx = rSW / 2;
+  const int cy = rSH / 2;
+  const float radius = min(rSW, rSH) * 0.463f;
+  constexpr float START_DEG = 122.0f;
+  constexpr float END_DEG = 58.0f;
+  constexpr float ARC_DEG = START_DEG - END_DEG;
+  float activeEndDeg = START_DEG - ARC_DEG * ((float)rRacingVolume / 255.0f);
+
+  for (float deg = START_DEG; deg >= END_DEG; deg -= 0.7f) {
+    float rad = deg * (3.14159265f / 180.0f);
+    int px = cx + (int)(cosf(rad) * radius);
+    int py = cy - (int)(sinf(rad) * radius);
+    alphaDot(px, py, inactiveColor, (int)(alpha255 * 0.55f), 3);
+  }
+  if (rRacingVolume > 0) {
+    for (float deg = START_DEG; deg >= activeEndDeg; deg -= 0.7f) {
+      float rad = deg * (3.14159265f / 180.0f);
+      int px = cx + (int)(cosf(rad) * radius);
+      int py = cy - (int)(sinf(rad) * radius);
+      alphaDot(px, py, activeColor, alpha255, 4);
+    }
+  }
+
+  char label[20];
+  int percent = ((int)rRacingVolume * 100 + 127) / 255;
+  snprintf(label, sizeof(label), "%d%%", percent);
+  gfxTextCenterAlpha(label, cx, 45, 2, 1, activeColor, alpha);
+  gfxTextCenterAlpha("-", cx - 76, 86, 2, 1, R_WHITE, alpha);
+  gfxTextCenterAlpha("+", cx + 76, 86, 2, 1, R_WHITE, alpha);
+}
+
 // ---- Game Over 覆盖层 ----
 static void drawGameOver() {
   gfxBox(0, 0, rSW, rSH, RRGB565(10, 10, 12));
@@ -2560,6 +2743,7 @@ void racingDraw() {
   drawCoinPops();
   drawDayPlaneFlyover();
   drawHUD();
+  drawVolumeHud();
   uint32_t tE = micros();
   if (rGameOver) drawGameOver();
   gfxPushFrame();
