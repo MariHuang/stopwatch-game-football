@@ -214,10 +214,55 @@ static const float COIN_CHAIN_GAP = 0.075f;    // 一串金币之间的前后间
 static const float COIN_APPROACH_RATE = 0.24f; // 世界固定金币：玩家接近时才慢慢变大
 static const float ROAD_SCROLL_RATE = 22.0f;   // 路面纹理滚动速度
 static const float ROAD_SCROLL_TO_Z = 0.05f;   // rSroll 到道路深度 t 的换算
-static const float NPC_APPROACH_RATE = ROAD_SCROLL_RATE * ROAD_SCROLL_TO_Z; // NPC 与虚线保持同一赛道速度
+static const float NPC_APPROACH_RATE = 0.24f;      // NPC 固定在赛道上，仅随玩家前进进入/离开视野
 static const float NPC_ADJACENT_MIN_GAP_Z = 0.70f; // 同车道/相邻车道前后至少约两辆车身长度
 static const float NPC_REAR_COLLISION_Z = 0.50f;   // NPC 车尾与玩家车头重合的纵向碰撞线
 static constexpr uint32_t NPC_CENTER_LANE_DELAY_MS = 5000; // 开局前 5 秒中间车道不生成 NPC
+
+struct TunnelRun {
+  uint16_t x;
+  uint16_t y;
+  uint8_t w;
+  uint8_t code;
+};
+static constexpr int TUNNEL_ROW_STEP = 1;
+static constexpr int TUNNEL_RUN_MAX = 12500;
+static TunnelRun tunnelRuns[TUNNEL_RUN_MAX];
+static uint16_t tunnelRunCount = 0;
+static bool tunnelRunsReady = false;
+
+static void buildUnderwaterTunnelRuns() {
+  if (tunnelRunsReady) return;
+  tunnelRunCount = 0;
+  for (int y = 0; y < UNDER_TUNNEL_SPRITE_H; y += TUNNEL_ROW_STEP) {
+    int row = y * UNDER_TUNNEL_SPRITE_STRIDE;
+    int x = 0;
+    while (x < UNDER_TUNNEL_SPRITE_W) {
+      uint8_t b = pgm_read_byte(&UNDER_TUNNEL_SPRITE_PIXELS[row + (x >> 1)]);
+      uint8_t code = (x & 1) ? (b & 0x0F) : (b >> 4);
+      if (code == 0) {
+        ++x;
+        continue;
+      }
+      int runStart = x++;
+      while (x < UNDER_TUNNEL_SPRITE_W) {
+        uint8_t nextB = pgm_read_byte(&UNDER_TUNNEL_SPRITE_PIXELS[row + (x >> 1)]);
+        uint8_t nextCode = (x & 1) ? (nextB & 0x0F) : (nextB >> 4);
+        if (nextCode != code) break;
+        ++x;
+      }
+      if (tunnelRunCount < TUNNEL_RUN_MAX) {
+        TunnelRun& run = tunnelRuns[tunnelRunCount++];
+        run.x = (uint16_t)runStart;
+        run.y = (uint16_t)y;
+        run.w = (uint8_t)min(255, x - runStart);
+        // 保留原始 4-bit 透明度等级，恢复骨架边缘抗锯齿，避免毛刺。
+        run.code = code;
+      }
+    }
+  }
+  tunnelRunsReady = true;
+}
 
 // 日间高楼和玩家车共用同一开场进度，避免帧率波动造成两套动画错拍。
 static float racingIntroEase() {
@@ -288,6 +333,10 @@ static void drawHeadlights(int cx, int baseY, int carW, int carH, float depth, b
 static void startRacingBgm();
 static void stopRacingBgm();
 
+static bool sceneTransitionLite() {
+  return (rSceneFrom != rSceneIdx) && (rSceneTransT < 1.0f || rDecorRevealT < 1.0f);
+}
+
 static void updateSceneState(float dt) {
   uint32_t now = millis();
   int nextScene = (rCoinScore / SCENE_COIN_INTERVAL) % 6;
@@ -295,7 +344,9 @@ static void updateSceneState(float dt) {
     rSceneFrom = rSceneIdx;
     rSceneIdx = nextScene;
     rSceneTransT = 0.0f;
-    rDecorExitT = 0.0f;
+    // 切场景时不再绘制旧场景下滑退出。旧版会在过渡期连续重绘重装饰层，
+    // 海底/黄昏/城市等场景容易出现明显掉帧；现在直接进入新场景升起。
+    rDecorExitT = 1.0f;
     rDecorRevealT = 0.0f;
     rCloudFade = 0.0f;   // 切场景时云朵重置为不可见，等装饰层升起后再渐显
     if (rSceneIdx == 3) {
@@ -474,6 +525,7 @@ void racingInit() {
   M5.Power.setVibration(0);
   rSW = min(RACING_RENDER_W, (int)M5.Display.width());
   rSH = min(RACING_RENDER_H, (int)M5.Display.height());
+  buildUnderwaterTunnelRuns();
   rSpeed = 0.6f;   // 起始即 60km/h
   rStartMs = millis();   // 记录开始时刻，用于分阶段自动提速
   rIntroStartMs = millis();  // 入场动画开始
@@ -1203,6 +1255,28 @@ static void drawDayPlaneFlyover() {
   int dx1 = min(dstW - 1, rSW - 1 - x0);
   if (dy1 < dy0 || dx1 < dx0) return;
 
+  if (fade >= 0.99f) {
+    int step = (dstW > 360 || dstH > 150) ? 2 : 1;
+    for (int dy = dy0; dy <= dy1; dy += step) {
+      int py = y0 + dy;
+      int sy = (dy * RACING_PLANE_H) / dstH;
+      int blockH = min(step, dy1 - dy + 1);
+      for (int dx = dx0; dx <= dx1; dx += step) {
+        int px = x0 + dx;
+        int sxImg = (dx * RACING_PLANE_W) / dstW;
+        int srcIdx = sy * RACING_PLANE_W + sxImg;
+        int alpha = pgm_read_byte(&RACING_PLANE_ALPHA[srcIdx]);
+        if (alpha <= 48) continue;
+        uint16_t c = pgm_read_word(&RACING_PLANE_PIXELS[srcIdx]);
+        int blockW = min(step, dx1 - dx + 1);
+        if (blockW == 1 && blockH == 1) gfxPixel(px, py, c);
+        else gfxBox(px, py, blockW, blockH, c);
+      }
+    }
+    return;
+  }
+
+  int fade255 = (int)(fade * 255.0f);
   for (int dy = dy0; dy <= dy1; ++dy) {
     int py = y0 + dy;
     int sy = (dy * RACING_PLANE_H) / dstH;
@@ -1210,7 +1284,7 @@ static void drawDayPlaneFlyover() {
       int px = x0 + dx;
       int sxImg = (dx * RACING_PLANE_W) / dstW;
       int srcIdx = sy * RACING_PLANE_W + sxImg;
-      int alpha = (int)(pgm_read_byte(&RACING_PLANE_ALPHA[srcIdx]) * fade);
+      int alpha = (pgm_read_byte(&RACING_PLANE_ALPHA[srcIdx]) * fade255) / 255;
       if (alpha <= 2) continue;
       uint16_t c = pgm_read_word(&RACING_PLANE_PIXELS[srcIdx]);
       if (alpha >= 250) gfxPixel(px, py, c);
@@ -1399,7 +1473,8 @@ static void drawDuskBackground(int horizonY, uint16_t skyC) {
     float dx = ((float)x - rSW * 0.5f) / (rSW * 0.5f);
     return seaY + (int)(seaSag * dx * dx);
   };
-  for (int y = 0; y < seaH; ++y) {
+  int seaStep = 1;
+  for (int y = 0; y < seaH; y += seaStep) {
     float t = (float)y / (float)max(1, seaH - 1);
     int x0 = 0;
     int w = rSW;
@@ -1408,7 +1483,7 @@ static void drawDuskBackground(int horizonY, uint16_t skyC) {
       x0 = rSW / 2 - halfW;
       w = max(1, halfW * 2 + 1);
     }
-    gfxBox(x0, seaY + y, w, 1, rLerpColor(seaTop, seaBot, t));
+    gfxBox(x0, seaY + y, w, min(seaStep, seaH - y), rLerpColor(seaTop, seaBot, t));
   }
   for (int x = 0; x < rSW; ++x) {
     float dx = ((float)x - rSW * 0.5f) / (rSW * 0.5f);
@@ -1504,7 +1579,9 @@ static void drawDesertBackground(int horizonY) {
     {0.76f, -1, 30, RRGB565(54, 104, 56)},
     {0.73f,  1, 30, RRGB565(70, 124, 64)},
   };
-  for (const auto& item : cacti) {
+  int cactusCount = (int)(sizeof(cacti) / sizeof(cacti[0]));
+  for (int i = 0; i < cactusCount; ++i) {
+    const auto& item = cacti[i];
     int y, halfW;
     roadGeom(item.t, y, halfW);
     y += rDecorYOffset;
@@ -1649,74 +1726,58 @@ static void drawUnderwaterTunnelImage() {
   const uint16_t tunnelDarkLit = RRGB565(8, 62, 108);
   const uint16_t tunnelBlue = RRGB565(96, 186, 255);
   const uint16_t tunnelBlueLit = RRGB565(190, 236, 255);
-  float tunnelTime = millis() * 0.001f;
-  float lightTravel = 1.0f - fmodf(tunnelTime * 2.05f, 1.0f);
-  if (lightTravel >= 1.0f) lightTravel = 0.0f;
+  // 海底隧道是性能热点：原先每帧扫描 4-bit 原图。
+  // 现在保留原始抗锯齿透明度，但通过预处理线段缓存避免每帧扫图。
+  uint32_t tunnelTick = millis();
+  int lightY = UNDER_TUNNEL_SPRITE_H - 1 -
+               (int)((tunnelTick / 5) % UNDER_TUNNEL_SPRITE_H);
 
   auto drawTunnelRun = [&](int rx, int ry, int rw, uint16_t color, int alpha) {
     if (ry < 0 || ry >= rSH || rw <= 0 || alpha <= 0) return;
     int xA = max(0, rx);
     int xB = min(rSW - 1, rx + rw - 1);
     if (xB < xA) return;
-    if (alpha >= 248) {
-      gfxBox(xA, ry, xB - xA + 1, 1, color);
-      return;
-    }
-    for (int px = xA; px <= xB; ++px) {
-      gfxPixel(px, ry, blendPixelAlpha565(gfxReadPixel(px, ry), color, alpha));
-    }
+    uint16_t c = (alpha >= 248) ? color : blendPixelAlpha565(waterBg, color, alpha);
+    gfxBox(xA, ry, xB - xA + 1, 1, c);
   };
 
-  // 直接从 4-bit PROGMEM 资源按同色/同透明度横向区段绘制。
-  // 0=透明，1..7=深骨架 alpha，8..15=蓝光 alpha。
-  for (int y = 0; y < UNDER_TUNNEL_SPRITE_H; ++y) {
-    int py = y0 + y;
+  buildUnderwaterTunnelRuns();
+  int cachedY = -1;
+  uint16_t rowColors[3] = {0, tunnelDark, tunnelBlue};
+  for (uint16_t i = 0; i < tunnelRunCount; ++i) {
+    const TunnelRun& run = tunnelRuns[i];
+    int py = y0 + (int)run.y;
     // 不在这里水平裁切底部；稍后绘制的弧形赛道路面会自然覆盖骨架，形成契合的弧形边界。
     if (py < 0 || py >= rSH) continue;
-    float rowT = (float)y / (float)max(1, UNDER_TUNNEL_SPRITE_H - 1); // 0=远端, 1=近端
-    float phase = rowT - lightTravel;
-    if (phase < 0.0f) phase += 1.0f;
-    float leadPulse = (phase < 0.16f) ? (1.0f - phase / 0.16f) : 0.0f;
-    float tailPulse = (phase > 0.78f) ? ((phase - 0.78f) / 0.22f) : 0.0f;
-    float pulse = max(leadPulse, tailPulse * 0.42f);
-    pulse = pulse * pulse * (3.0f - 2.0f * pulse);
-    float flicker = 0.82f + 0.18f * sinf(tunnelTime * 14.0f + y * 0.19f);
-    float glow = constrain(pulse * flicker, 0.0f, 1.0f);
-    uint16_t rowColors[3] = {
-      0,
-      rLerpColor(tunnelDark, tunnelDarkLit, glow * 0.72f),
-      rLerpColor(tunnelBlue, tunnelBlueLit, glow)
-    };
-    // 退出时整体向海水色渐隐
-    if (exitFade < 1.0f) {
-      rowColors[1] = rLerpColor(waterBg, rowColors[1], exitFade);
-      rowColors[2] = rLerpColor(waterBg, rowColors[2], exitFade);
-    }
-    int row = y * UNDER_TUNNEL_SPRITE_STRIDE;
-    int x = 0;
-    while (x < UNDER_TUNNEL_SPRITE_W) {
-      uint8_t b = pgm_read_byte(&UNDER_TUNNEL_SPRITE_PIXELS[row + (x >> 1)]);
-      uint8_t code = (x & 1) ? (b & 0x0F) : (b >> 4);
-      if (code == 0) {
-        ++x;
-        continue;
+    if ((int)run.y != cachedY) {
+      cachedY = run.y;
+      int phasePx = cachedY - lightY;
+      if (phasePx < 0) phasePx += UNDER_TUNNEL_SPRITE_H;
+      int glow255 = 0;
+      if (phasePx < 50) {
+        glow255 = 255 - (phasePx * 255) / 50;
+      } else if (phasePx > UNDER_TUNNEL_SPRITE_H - 70) {
+        glow255 = ((phasePx - (UNDER_TUNNEL_SPRITE_H - 70)) * 96) / 70;
       }
-      int runStart = x++;
-      while (x < UNDER_TUNNEL_SPRITE_W) {
-        uint8_t nextB = pgm_read_byte(&UNDER_TUNNEL_SPRITE_PIXELS[row + (x >> 1)]);
-        uint8_t nextCode = (x & 1) ? (nextB & 0x0F) : (nextB >> 4);
-        if (nextCode != code) break;
-        ++x;
+      glow255 = (glow255 * glow255 * (765 - 2 * glow255)) / (255 * 255);
+      float glow = (float)glow255 / 255.0f;
+      rowColors[1] = rLerpColor(tunnelDark, tunnelDarkLit, glow * 0.72f);
+      rowColors[2] = rLerpColor(tunnelBlue, tunnelBlueLit, glow);
+      // 退出时整体向海水色渐隐
+      if (exitFade < 1.0f) {
+        rowColors[1] = rLerpColor(waterBg, rowColors[1], exitFade);
+        rowColors[2] = rLerpColor(waterBg, rowColors[2], exitFade);
       }
-      int level = (code >= 8) ? 2 : 1;
-      int alphaLevel = (code >= 8) ? (code - 8) : code;
-      int alpha = (alphaLevel * 255 + 3) / 7;
-      drawTunnelRun(x0 + runStart, py, x - runStart, rowColors[level], alpha);
     }
+    int level = (run.code >= 8) ? 2 : 1;
+    int alphaLevel = (run.code >= 8) ? (run.code - 8) : run.code;
+    int alpha = (alphaLevel * 255 + 3) / 7;
+    drawTunnelRun(x0 + run.x, py, run.w, rowColors[level], alpha);
   }
 }
 
 static void drawUnderwaterBackground(int horizonY, uint16_t skyC) {
+  bool lite = sceneTransitionLite();
   bool enteringUnderwater = (rSceneIdx == 2 && rSceneFrom != 2);
   float oceanFade = enteringUnderwater
                       ? min(1.0f, rDecorRevealT * 1.65f)
@@ -1739,11 +1800,12 @@ static void drawUnderwaterBackground(int horizonY, uint16_t skyC) {
     const int rayCenters[5] = { -178, -88, 0, 88, 178 };
     const int rayHalfWidths[5] = { 18, 24, 30, 24, 18 };
     float rayTime = millis() * 0.001f;
-    float horizontalSweep = sinf(rayTime * 0.90f); // 左→右→左平滑往返
+    float horizontalSweep = sinf(rayTime * 0.32f); // 左→右→左缓慢扫光
     float brightCenter = (horizontalSweep + 1.0f) * 2.0f; // 亮度焦点在第 0..4 根光柱间横向移动
     int bottomSweepX = (int)lroundf(horizontalSweep * 22.0f);
     int topSweepX = (int)lroundf(horizontalSweep * 4.0f);
-    for (int i = 0; i < 5; ++i) {
+    int rayStep = lite ? 2 : 1;
+    for (int i = 0; i < 5; i += rayStep) {
       // 亮度只沿水平方向依次扫过五根光柱，垂直方向保留静态渐隐。
       float focus = constrain(1.0f - fabsf((float)i - brightCenter) / 1.55f, 0.0f, 1.0f);
       focus = focus * focus * (3.0f - 2.0f * focus);
@@ -1755,7 +1817,7 @@ static void drawUnderwaterBackground(int horizonY, uint16_t skyC) {
       int bottomLeft = bottomX - rayHalfWidths[i];
       int bottomRight = bottomX + rayHalfWidths[i];
       int visibleTopY = max(0, rayTopY);
-      const int gradientSteps = 24;  // 降低水下光束分段数，视觉仍平滑，海底场景更流畅
+      const int gradientSteps = lite ? 6 : 12;  // 过渡期进一步减少三角形填充次数
       for (int step = 0; step < gradientSteps; ++step) {
         int y0 = visibleTopY + (rayEndY - visibleTopY) * step / gradientSteps;
         int y1 = visibleTopY + (rayEndY - visibleTopY) * (step + 1) / gradientSteps;
@@ -1773,14 +1835,16 @@ static void drawUnderwaterBackground(int horizonY, uint16_t skyC) {
       }
     }
 
-    uint16_t bubble = rLerpColor(waterTop, RRGB565(150, 230, 225), oceanEase);
-    uint16_t bubbleHi = rLerpColor(waterTop, RRGB565(205, 255, 250), oceanEase);
-    for (int i = 0; i < 16; ++i) {
-      int x = 18 + ((i * 67 + 13) % (rSW - 36));
-      int y = 22 + ((i * 43 + 9) % max(1, roadBodyTopY() + 80)) + rDecorYOffset;
-      int r = 1 + (i % 4);
-      gfxDrawCircle(x, y, r, bubble);
-      if (r > 2) gfxPixel(x + r - 1, y - r + 1, bubbleHi);
+    if (!lite) {
+      uint16_t bubble = rLerpColor(waterTop, RRGB565(150, 230, 225), oceanEase);
+      uint16_t bubbleHi = rLerpColor(waterTop, RRGB565(205, 255, 250), oceanEase);
+      for (int i = 0; i < 10; ++i) {
+        int x = 18 + ((i * 67 + 13) % (rSW - 36));
+        int y = 22 + ((i * 43 + 9) % max(1, roadBodyTopY() + 80)) + rDecorYOffset;
+        int r = 1 + (i % 4);
+        gfxDrawCircle(x, y, r, bubble);
+        if (r > 2) gfxPixel(x + r - 1, y - r + 1, bubbleHi);
+      }
     }
 
     // 先完成蓝色海洋背景，再让鱼群淡入；避免刚切场景时鱼比海水先出现。
@@ -1809,19 +1873,19 @@ static void drawUnderwaterBackground(int horizonY, uint16_t skyC) {
       {-360, horizonY + 30, 3, false, 1, 0.018f},
     };
     uint32_t nowMs = millis();
-    if (fishFade > 0.01f) {
-      for (int i = 0; i < (int)(sizeof(fish) / sizeof(fish[0])); ++i) {
+    if (!lite && fishFade > 0.01f) {
+      static const int8_t swimWave[16] = {0, 0, 1, 1, 2, 2, 1, 1, 0, -1, -1, -2, -2, -1, -1, 0};
+      const int fishCount = 6;
+      for (int i = 0; i < fishCount; ++i) {
         int x = wrapFishX(nowMs, fish[i].baseX, 70, fish[i].speed, fish[i].flip);
-        int y = fish[i].y + rDecorYOffset + (int)(sinf(nowMs * 0.00045f + i * 0.9f) * 4.0f);
+        int bob = swimWave[((nowMs / 130) + i * 3) & 15];
+        int y = fish[i].y + rDecorYOffset + bob;
         uint16_t c = (i % 3 == 0) ? fishDeep : ((i % 2 == 0) ? fishMid : fishDark);
         drawFishSilhouette(x, y, fish[i].scale, c, fish[i].flip, fish[i].variant);
       }
       int sharkX = wrapFishX(nowMs, -220, 130, 0.006f, false);
-      int sharkY = horizonY + 72 + rDecorYOffset + (int)(sinf(nowMs * 0.00028f) * 5.0f);
+      int sharkY = horizonY + 72 + rDecorYOffset + swimWave[(nowMs / 170) & 15];
       drawSharkSilhouette(sharkX, sharkY, 7, fishDeep, false);
-      int sharkX2 = wrapFishX(nowMs, 260, 120, 0.0045f, true);
-      int sharkY2 = horizonY - 58 + rDecorYOffset + (int)(sinf(nowMs * 0.00024f + 1.7f) * 4.0f);
-      drawSharkSilhouette(sharkX2, sharkY2, 5, fishDark, true);
     }
   }
   // 仅隧道轮廓保留上升动画
@@ -1937,7 +2001,7 @@ static void drawRoadSurface(uint16_t edgeC, uint16_t roadC, uint16_t dashC) {
 
   // 赛道两侧实线：跟随椭圆边缘轨迹，颜色跟随当前场景虚线颜色，线宽按透视远小近大。
   static const float sideLinePos[2] = { -0.76f, 0.76f };
-  const int sidePieces = 96;
+  const int sidePieces = 64;
   for (int side = 0; side < 2; ++side) {
     int prevX = -1, prevY = -1, prevHalfW = 0;
     float prevEmerge = 0.0f;
@@ -1989,7 +2053,7 @@ static void drawRoadSurface(uint16_t edgeC, uint16_t roadC, uint16_t dashC) {
       dashStart = max(0.03f, dashStart);
       dashEnd = min(0.995f, dashEnd);
       if (dashEnd <= dashStart) continue;
-      const int pieces = 16;
+      const int pieces = 10;
       int prevX = -1, prevY = -1, prevHalfW = 0;
       float prevWrap = 0;
       for (int i = 0; i <= pieces; ++i) {
@@ -2316,6 +2380,11 @@ static void fillQuad(int x0, int y0, int x1, int y1, int x2, int y2, int x3, int
 }
 // 逐像素 alpha 混合的四边形：每个像素读取背景，和 color 按 alpha 混合
 static void fillQuadAlpha(int x0, int y0, int x1, int y1, int x2, int y2, int x3, int y3, uint16_t color, float alpha) {
+  if (alpha >= 0.94f) {
+    fillQuad(x0, y0, x1, y1, x2, y2, x3, y3, color);
+    return;
+  }
+  if (alpha <= 0.02f) return;
   int minY = max(0, min(min(y0, y1), min(y2, y3)));
   int maxY = min(rSH - 1, max(max(y0, y1), max(y2, y3)));
   const int edges[4][4] = {{x0,y0,x1,y1},{x1,y1,x2,y2},{x2,y2,x3,y3},{x3,y3,x0,y0}};
@@ -2708,7 +2777,7 @@ static void drawVolumeHud() {
   char label[20];
   int percent = ((int)rRacingVolume * 100 + 127) / 255;
   snprintf(label, sizeof(label), "%d%%", percent);
-  gfxTextCenterAlpha(label, cx, 45, 2, 1, activeColor, alpha);
+  gfxTextCenterAlpha(label, cx, 45, 2, 1, R_WHITE, alpha);
   gfxTextCenterAlpha("-", cx - 76, 86, 2, 1, R_WHITE, alpha);
   gfxTextCenterAlpha("+", cx + 76, 86, 2, 1, R_WHITE, alpha);
 }

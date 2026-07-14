@@ -1303,7 +1303,7 @@ void loop() {
     }
     racingDraw();
     uint32_t frameElapsed = millis() - now;
-    delay(frameElapsed < 16 ? 16 - frameElapsed : 1);
+    delay(frameElapsed < 16 ? 16 - frameElapsed : 0);
     return;
   }
 
